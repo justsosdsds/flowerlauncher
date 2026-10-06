@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FlowerLauncher</string>
+    <string name="search_hint">Search apps</string>
+    <string name="smart_search">Smart search</string>
+    <string name="no_results">No matching apps</string>
+    <string name="launch_failed">Unable to open %1$s</string>
+    <string name="search">Search</string>
+    <string name="close">Close</string>
+</resources>

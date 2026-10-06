@@ -1,0 +1,557 @@
+--- /mnt/data/shepherd_v72_baseline/shepherd_v72/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt	2026-10-02 06:49:03.000000000 +0000
++++ app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt	2026-10-02 07:42:50.487687153 +0000
+@@ -37,6 +37,12 @@
+     Hiding,
+ }
+ 
++enum class SearchImeCommand {
++    None,
++    Show,
++    Hide,
++}
++
+ data class SearchState(
+     val query: String = "",
+     val phase: SearchPhase = SearchPhase.Hidden,
+@@ -100,7 +106,8 @@
+         state = state.copy(
+             phase = SearchPhase.Hidden,
+             presentationMode = SearchPresentationMode.Input,
+-            imePhase = SearchImePhase.Hidden,
++            // Preserve the acknowledged/in-flight IME phase. SearchContent remains mounted
++            // long enough to serialize any required final Hide even for an abrupt Home reset.
+             pageReturnImeSuppressed = false,
+         )
+     }
+@@ -119,7 +126,8 @@
+                         state = state.copy(
+                             phase = SearchPhase.Active,
+                             presentationMode = SearchPresentationMode.Input,
+-                            imePhase = SearchImePhase.Hidden,
++                            // Do not erase a previous in-flight Hide/Show acknowledgement.
++                            // The reconciler will converge it safely before the new Input show.
+                             sessionId = state.sessionId + 1L,
+                         )
+                     }
+@@ -130,13 +138,25 @@
+ 
+             is SearchIntent.ImeVisibilityChanged -> {
+                 if (intent.visible) {
+-                    // Actual IME visibility confirms the desired Input presentation.
+-                    if (state.phase != SearchPhase.Hidden) {
+-                        state = state.copy(
+-                            presentationMode = SearchPresentationMode.Input,
+-                            imePhase = SearchImePhase.Visible,
+-                        )
+-                    }
++                    // Visibility is an acknowledgement, not the source of truth for the
++                    // desired presentation. Only an external/user reveal from a fully
++                    // Hidden-IME + Expanded active Search may promote the target to Input.
++                    // Late visibility from an in-flight Show is still recorded even after
++                    // the Search session became Hidden so the reconciler can issue one final Hide.
++                    val externalReveal =
++                        state.phase == SearchPhase.Active &&
++                            !state.pageReturnImeSuppressed &&
++                            state.presentationMode == SearchPresentationMode.Expanded &&
++                            state.imePhase == SearchImePhase.Hidden
++
++                    state = state.copy(
++                        presentationMode = if (externalReveal) {
++                            SearchPresentationMode.Input
++                        } else {
++                            state.presentationMode
++                        },
++                        imePhase = SearchImePhase.Visible,
++                    )
+                 } else {
+                     val userCollapsedIme =
+                         intent.userInitiatedHide &&
+@@ -163,14 +183,10 @@
+ 
+             SearchIntent.EnterExpandedMode -> {
+                 if (state.phase == SearchPhase.Active) {
+-                    state = state.copy(
+-                        presentationMode = SearchPresentationMode.Expanded,
+-                        imePhase = if (state.imePhase == SearchImePhase.Visible) {
+-                            SearchImePhase.Hiding
+-                        } else {
+-                            state.imePhase
+-                        },
+-                    )
++                    // Change only the desired presentation. The serialized IME reconciler
++                    // below owns the Visible -> Hiding transition immediately before it
++                    // emits the actual Hide command.
++                    state = state.copy(presentationMode = SearchPresentationMode.Expanded)
+                 }
+             }
+ 
+@@ -220,10 +236,7 @@
+             state.imePhase != SearchImePhase.Hiding &&
+             contentOverflowAboveImePx > collapseOverflowThresholdPx
+         ) {
+-            state = state.copy(
+-                presentationMode = SearchPresentationMode.Expanded,
+-                imePhase = SearchImePhase.Hiding,
+-            )
++            state = state.copy(presentationMode = SearchPresentationMode.Expanded)
+             effect = SearchPreScrollEffect.HideIme
+         }
+ 
+@@ -255,10 +268,7 @@
+             visual >= revealPullThresholdPx &&
+             state.imePhase != SearchImePhase.Showing
+         ) {
+-            state = state.copy(
+-                presentationMode = SearchPresentationMode.Input,
+-                imePhase = SearchImePhase.Showing,
+-            )
++            state = state.copy(presentationMode = SearchPresentationMode.Input)
+             return SearchBoundaryEffect.RevealIme
+         }
+ 
+@@ -288,6 +298,69 @@
+         return SearchBoundaryEffect.None
+     }
+ 
++
++    /**
++     * Reconcile Search's desired presentation with the acknowledged IME phase.
++     *
++     * Show and Hide are strictly serialized:
++     * - while Showing, a newer hide target waits for Visible before Hide is emitted;
++     * - while Hiding, a newer input target waits for Hidden before Show is emitted.
++     *
++     * presentationReady is only a gate for starting Show. Falling below that gate does
++     * not itself request Hide; Hidden session, page-return suppression, Expanded mode,
++     * and explicit UI force-hide policy own hiding.
++     */
++    fun reconcileIme(
++        presentationReady: Boolean,
++        forceHide: Boolean = false,
++    ): SearchImeCommand {
++        val wantsHide =
++            forceHide ||
++                state.phase == SearchPhase.Hidden ||
++                state.pageReturnImeSuppressed ||
++                state.presentationMode == SearchPresentationMode.Expanded
++
++        if (wantsHide) {
++            return when (state.imePhase) {
++                SearchImePhase.Visible -> {
++                    state = state.copy(imePhase = SearchImePhase.Hiding)
++                    SearchImeCommand.Hide
++                }
++
++                // Never issue Hide while a Show command is still in flight. Wait for the
++                // Visible acknowledgement, then this reconciler will emit Hide exactly once.
++                SearchImePhase.Showing,
++                SearchImePhase.Hiding,
++                SearchImePhase.Hidden,
++                -> SearchImeCommand.None
++            }
++        }
++
++        val wantsShow =
++            state.phase == SearchPhase.Active &&
++                state.presentationMode == SearchPresentationMode.Input &&
++                presentationReady &&
++                !state.pageReturnImeSuppressed
++
++        if (wantsShow) {
++            return when (state.imePhase) {
++                SearchImePhase.Hidden -> {
++                    state = state.copy(imePhase = SearchImePhase.Showing)
++                    SearchImeCommand.Show
++                }
++
++                // Never issue Show while Hide is still in flight. Hidden acknowledgement
++                // will cause the next reconciliation pass to emit Show exactly once.
++                SearchImePhase.Hiding,
++                SearchImePhase.Showing,
++                SearchImePhase.Visible,
++                -> SearchImeCommand.None
++            }
++        }
++
++        return SearchImeCommand.None
++    }
++
+     fun beginInteractive() {
+         interaction.beginInteractive()
+     }
+--- /mnt/data/shepherd_v72_baseline/shepherd_v72/app/src/main/java/com/flower/launcher/ui/SearchContent.kt	2026-10-02 06:50:29.000000000 +0000
++++ app/src/main/java/com/flower/launcher/ui/SearchContent.kt	2026-10-02 07:38:23.091755166 +0000
+@@ -131,7 +131,8 @@
+     apps: List<InstalledApp>,
+     hiddenComponentKeys: Set<String>,
+     preferences: SearchPreferences,
+-    requestKeyboard: Boolean,
++    imePresentationReady: Boolean,
++    forceHideIme: Boolean = false,
+     coordinator: SearchCoordinator,
+     reboundDurationMs: Int = 320,
+     onReturnHomeThreshold: () -> Boolean = { false },
+@@ -167,7 +168,6 @@
+     val interactionScope = rememberCoroutineScope()
+     val interactionState = coordinator.interaction
+     var searchFieldFocused by remember { mutableStateOf(false) }
+-    var programmaticImeHidePending by remember { mutableStateOf(false) }
+ 
+     // Search keeps one fixed full-height result surface. IME insets only position the
+     // floating field; they never resize the result viewport. This removes the scroll-range
+@@ -222,19 +222,20 @@
+         }
+     }
+ 
+-    // Keep actual IME visibility separate from Search's desired presentation mode.
+-    // A system/user keyboard dismissal normally leaves the text field focused; app-driven
+-    // hides mark programmaticImeHidePending first so they do not accidentally turn Input
+-    // into Expanded.
++    // Actual IME visibility is only an acknowledgement. Programmatic hides are identified
++    // by SearchImePhase.Hiding, so no separate boolean can be cleared too early by a newer
++    // Show request. A Visible -> Hidden transition while the field remains focused is the
++    // only path treated as a user/system dismissal into Expanded mode.
+     LaunchedEffect(imeVisible) {
+         coordinator.dispatch(
+             SearchIntent.ImeVisibilityChanged(
+                 visible = imeVisible,
+                 userInitiatedHide =
+-                    !imeVisible && searchFieldFocused && !programmaticImeHidePending,
++                    !imeVisible &&
++                        searchFieldFocused &&
++                        coordinator.state.imePhase == SearchImePhase.Visible,
+             ),
+         )
+-        if (!imeVisible) programmaticImeHidePending = false
+     }
+ 
+     val prefixMatch = remember(query, targets) { matchSearchTargetPrefix(query, targets) }
+@@ -254,24 +255,43 @@
+         buildMap { apps.forEach { app -> if (app.packageName !in this) put(app.packageName, app) } }
+     }
+ 
+-    LaunchedEffect(requestKeyboard) {
+-        if (requestKeyboard) {
+-            programmaticImeHidePending = false
+-            if (queryValue.text.isNotEmpty()) {
+-                queryValue = queryValue.copy(selection = TextRange(0, queryValue.text.length))
++    // Strictly serialize IME commands. The coordinator advances Hidden -> Showing before
++    // Show and Visible -> Hiding before Hide. If the desired target reverses while a command
++    // is in flight, the opposite command waits for the corresponding WindowInsets
++    // acknowledgement instead of racing it.
++    LaunchedEffect(
++        imePresentationReady,
++        forceHideIme,
++        searchState.presentationMode,
++        searchState.imePhase,
++        searchState.phase,
++        searchState.pageReturnImeSuppressed,
++    ) {
++        when (
++            coordinator.reconcileIme(
++                presentationReady = imePresentationReady,
++                forceHide = forceHideIme,
++            )
++        ) {
++            SearchImeCommand.Show -> {
++                if (queryValue.text.isNotEmpty()) {
++                    queryValue = queryValue.copy(selection = TextRange(0, queryValue.text.length))
++                }
++                focusRequester.requestFocus()
++                keyboardController?.show()
+             }
+-            focusRequester.requestFocus()
+-            keyboardController?.show()
+-        } else {
+-            programmaticImeHidePending = true
+-            focusManager.clearFocus()
+-            keyboardController?.hide()
++
++            SearchImeCommand.Hide -> {
++                focusManager.clearFocus()
++                keyboardController?.hide()
++            }
++
++            SearchImeCommand.None -> Unit
+         }
+     }
+ 
+     DisposableEffect(Unit) {
+         onDispose {
+-            programmaticImeHidePending = true
+             focusManager.clearFocus()
+             keyboardController?.hide()
+         }
+@@ -306,11 +326,9 @@
+                 )
+ 
+                 when (effect) {
+-                    SearchPreScrollEffect.HideIme -> {
+-                        programmaticImeHidePending = true
+-                        focusManager.clearFocus()
+-                        keyboardController?.hide()
+-                    }
++                    // The coordinator already changed the presentation target to Expanded.
++                    // The serialized reconciler above emits Hide at the safe IME phase.
++                    SearchPreScrollEffect.HideIme -> Unit
+                     SearchPreScrollEffect.ConsumeAll -> return available
+                     SearchPreScrollEffect.None -> Unit
+                 }
+@@ -354,9 +372,6 @@
+                                     strengthPercent = preferences.homeReturnHapticStrengthPercent,
+                                 )
+                             }
+-                            programmaticImeHidePending = true
+-                            focusManager.clearFocus()
+-                            keyboardController?.hide()
+                         }
+                     }
+ 
+@@ -367,9 +382,8 @@
+                                 strengthPercent = preferences.imeRevealHapticStrengthPercent,
+                             )
+                         }
+-                        programmaticImeHidePending = false
+-                        focusRequester.requestFocus()
+-                        keyboardController?.show()
++                        // onTopBoundaryDrag already changed the target to Input.
++                        // The serialized reconciler emits Show after any in-flight Hide ends.
+                     }
+ 
+                     SearchBoundaryEffect.ConsumeAll,
+@@ -484,8 +498,8 @@
+                         val text = target.prefix.orEmpty() + " "
+                         queryValue = TextFieldValue(text, selection = TextRange(text.length))
+                         coordinator.dispatch(SearchIntent.QueryChanged(text))
++                        coordinator.dispatch(SearchIntent.EnterInputMode)
+                         focusRequester.requestFocus()
+-                        keyboardController?.show()
+                     },
+                 )
+                 Spacer(modifier = Modifier.height(12.dp))
+@@ -641,24 +655,20 @@
+                         queryValue = TextFieldValue("")
+                         coordinator.dispatch(SearchIntent.QueryChanged(""))
+                         coordinator.dispatch(SearchIntent.EnterInputMode)
+-                        programmaticImeHidePending = false
+                         focusRequester.requestFocus()
+-                        keyboardController?.show()
+                     },
+                     onSearch = {
+                         val matched = prefixMatch
+                         if (matched != null) {
+                             if (effectiveQuery.isNotEmpty()) {
+-                                programmaticImeHidePending = true
+-                                keyboardController?.hide()
++                                coordinator.dispatch(SearchIntent.EnterExpandedMode)
+                                 focusManager.clearFocus()
+                                 onSearchTarget(matched.target, effectiveQuery)
+                             }
+                         } else {
+                             val bestMatch = results.firstOrNull()
+                             if (trimmedQuery.isNotEmpty() && bestMatch != null) {
+-                                programmaticImeHidePending = true
+-                                keyboardController?.hide()
++                                coordinator.dispatch(SearchIntent.EnterExpandedMode)
+                                 focusManager.clearFocus()
+                                 onAppSelected(bestMatch)
+                             } else if (trimmedQuery.isNotEmpty()) {
+@@ -677,9 +687,6 @@
+                     modifier = Modifier
+                         .size(36.dp)
+                         .clickable {
+-                            programmaticImeHidePending = true
+-                            keyboardController?.hide()
+-                            focusManager.clearFocus()
+                             onOpenSettings()
+                         }
+                         .padding(6.dp),
+--- /mnt/data/shepherd_v72_baseline/shepherd_v72/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt	2026-10-02 06:54:47.000000000 +0000
++++ app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt	2026-10-02 07:42:50.488047064 +0000
+@@ -594,8 +594,9 @@
+                 ).coerceAtLeast(0f)
+                 if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
+                     searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+-                    // The derived presentation gate becomes false; SearchContent then
+-                    // clears focus and hides the IME without mutating the Input target.
++                    // Suppression is the hide policy. The 5.5% presentation gate only
++                    // controls when Input may show, so crossing it in reverse cannot race
++                    // an in-flight IME Show with an unrelated Hide.
+                 }
+             }
+ 
+@@ -1216,10 +1217,8 @@
+                     apps = searchApps,
+                     hiddenComponentKeys = appCustomizations.hiddenComponentKeys,
+                     preferences = searchPreferences,
+-                    requestKeyboard =
+-                        searchImePresentationReady &&
+-                            searchCoordinator.state.presentationMode == SearchPresentationMode.Input &&
+-                            !showSearchSettings,
++                    imePresentationReady = searchImePresentationReady,
++                    forceHideIme = showSearchSettings,
+                     coordinator = searchCoordinator,
+                     reboundDurationMs = launcherPreferences.searchReboundDurationMs,
+                     onReturnHomeThreshold = {
+--- /mnt/data/shepherd_v72_baseline/shepherd_v72/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt	2026-10-02 06:51:16.000000000 +0000
++++ app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt	2026-10-02 07:42:27.959526098 +0000
+@@ -101,6 +101,11 @@
+ 
+         assertEquals(SearchBoundaryEffect.RevealIme, effect)
+         assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
+         assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
+         assertTrue(coordinator.interaction.rawOverscrollPx > 0f)
+     }
+@@ -117,6 +122,11 @@
+ 
+         assertEquals(SearchBoundaryEffect.RevealIme, effect)
+         assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
+         assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
+     }
+ 
+@@ -147,6 +157,11 @@
+ 
+         assertEquals(SearchPreScrollEffect.HideIme, effect)
+         assertEquals(SearchPresentationMode.Expanded, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Hide,
++            coordinator.reconcileIme(presentationReady = true),
++        )
+         assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
+     }
+ 
+@@ -208,4 +223,123 @@
+         assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
+         assertEquals(SearchPhase.Active, coordinator.state.phase)
+     }
++
++    @Test fun pageReturnReversalSerializesShowThenHideThenShow() {
++        val coordinator = activeCoordinator()
++
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++
++        coordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
++
++        // A newer hide target must not send Hide while Show is still in flight.
++        assertEquals(
++            SearchImeCommand.None,
++            coordinator.reconcileIme(presentationReady = false),
++        )
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++
++        // The late Visible acknowledgement does not overwrite the desired Input target
++        // or suppression policy; it merely completes the in-flight Show.
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++
++        assertEquals(
++            SearchImeCommand.Hide,
++            coordinator.reconcileIme(presentationReady = false),
++        )
++        assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
++
++        // Same-pointer reversal back to Search clears suppression while Hide is still
++        // in flight. Show must wait until Hidden is acknowledged.
++        coordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++        coordinator.dispatch(SearchIntent.ResumeActive)
++        assertEquals(
++            SearchImeCommand.None,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
++
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(false))
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++    }
++
++    @Test fun presentationReadinessFallingBelowThresholdDoesNotHideVisibleIme() {
++        val coordinator = activeCoordinator()
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        assertEquals(
++            SearchImeCommand.None,
++            coordinator.reconcileIme(presentationReady = false),
++        )
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++    }
++
++    @Test fun lateVisibleAcknowledgementCannotUndoNewerExpandedTarget() {
++        val coordinator = activeCoordinator()
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++
++        coordinator.dispatch(SearchIntent.EnterExpandedMode)
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        assertEquals(SearchPresentationMode.Expanded, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Hide,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
++    }
++
++    @Test fun userOrSystemRevealFromStableExpandedStateReturnsToInput() {
++        val coordinator = activeCoordinator(expanded = true)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++    }
++
++
++    @Test fun abruptSessionEndStillSerializesFinalImeHide() {
++        val coordinator = activeCoordinator()
++        assertEquals(
++            SearchImeCommand.Show,
++            coordinator.reconcileIme(presentationReady = true),
++        )
++        coordinator.dispatch(SearchIntent.SessionActiveChanged(false))
++
++        // Session teardown must not erase the in-flight Show phase.
++        assertEquals(SearchPhase.Hidden, coordinator.state.phase)
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.None,
++            coordinator.reconcileIme(presentationReady = false),
++        )
++
++        // If the old Show becomes visible after Home already won, acknowledge it and hide once.
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++        assertEquals(SearchImePhase.Visible, coordinator.state.imePhase)
++        assertEquals(
++            SearchImeCommand.Hide,
++            coordinator.reconcileIme(presentationReady = false),
++        )
++        assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
++    }
++
+ }

@@ -1,0 +1,659 @@
+--- a/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt
+@@ -11,9 +11,10 @@
+ /**
+  * Search domain state owned independently from LauncherRoot.
+  *
+- * The coordinator owns Search session lifecycle, query presence, semantic IME phase,
+- * boundary overscroll and single-fire threshold commits. UI reports intents and executes
+- * the returned effects; LauncherRoot only reacts to page-level effects such as ReturnHome.
++ * The coordinator owns Search session lifecycle, the desired presentation mode,
++ * semantic IME phase, boundary overscroll and single-fire threshold commits.
++ * UI reports intents and executes returned effects; LauncherRoot only reacts to
++ * page-level effects such as ReturnHome.
+  */
+ enum class SearchPhase {
+     Hidden,
+@@ -21,6 +22,14 @@
+     Returning,
+ }
+ 
++enum class SearchPresentationMode {
++    /** Search is in text-input mode: the field wants focus and IME when the page is ready. */
++    Input,
++
++    /** Search is expanded: IME is hidden and the results viewport uses the full height. */
++    Expanded,
++}
++
+ enum class SearchImePhase {
+     Hidden,
+     Showing,
+@@ -31,12 +40,9 @@
+ data class SearchState(
+     val query: String = "",
+     val phase: SearchPhase = SearchPhase.Hidden,
++    val presentationMode: SearchPresentationMode = SearchPresentationMode.Input,
+     val imePhase: SearchImePhase = SearchImePhase.Hidden,
+     val sessionId: Long = 0L,
+-    // Desired automatic keyboard state from the page transition. Keep this separately
+-    // from keyboardRequested so an early request is not lost while Search is still Hidden.
+-    val autoKeyboardRequested: Boolean = false,
+-    val keyboardRequested: Boolean = false,
+     val pageReturnImeSuppressed: Boolean = false,
+ ) {
+     val hasQuery: Boolean
+@@ -46,8 +52,22 @@
+ sealed interface SearchIntent {
+     data class QueryChanged(val query: String) : SearchIntent
+     data class SessionActiveChanged(val active: Boolean) : SearchIntent
+-    data class ImeVisibilityChanged(val visible: Boolean) : SearchIntent
+-    data class AutoKeyboardRequested(val requested: Boolean) : SearchIntent
++
++    /**
++     * Reports the actual IME visibility. userInitiatedHide is true only when the field
++     * still owns focus and SearchContent did not initiate the hide itself.
++     */
++    data class ImeVisibilityChanged(
++        val visible: Boolean,
++        val userInitiatedHide: Boolean = false,
++    ) : SearchIntent
++
++    /** Explicitly target input mode, e.g. same-pointer Search return reversal. */
++    data object EnterInputMode : SearchIntent
++
++    /** Explicitly target the full-height expanded mode. */
++    data object EnterExpandedMode : SearchIntent
++
+     data object SuppressImeForPageReturn : SearchIntent
+     data object AllowImeAfterPageReturn : SearchIntent
+     data object PageReturnStarted : SearchIntent
+@@ -79,9 +99,8 @@
+         interaction.resetSessionImmediately()
+         state = state.copy(
+             phase = SearchPhase.Hidden,
++            presentationMode = SearchPresentationMode.Input,
+             imePhase = SearchImePhase.Hidden,
+-            autoKeyboardRequested = false,
+-            keyboardRequested = false,
+             pageReturnImeSuppressed = false,
+         )
+     }
+@@ -95,11 +114,13 @@
+             is SearchIntent.SessionActiveChanged -> {
+                 if (intent.active) {
+                     if (state.phase == SearchPhase.Hidden) {
++                        // Every fresh Home -> Search session has one deterministic target:
++                        // Input. The page-progress gate decides when the UI may realize it.
+                         state = state.copy(
+                             phase = SearchPhase.Active,
++                            presentationMode = SearchPresentationMode.Input,
++                            imePhase = SearchImePhase.Hidden,
+                             sessionId = state.sessionId + 1L,
+-                            keyboardRequested =
+-                                state.autoKeyboardRequested && !state.pageReturnImeSuppressed,
+                         )
+                     }
+                 } else if (state.phase != SearchPhase.Hidden) {
+@@ -108,28 +129,55 @@
+             }
+ 
+             is SearchIntent.ImeVisibilityChanged -> {
+-                // Hidden Search must never acquire a visible IME semantic state.
+-                if (state.phase != SearchPhase.Hidden || !intent.visible) {
++                if (intent.visible) {
++                    // Actual IME visibility confirms the desired Input presentation.
++                    if (state.phase != SearchPhase.Hidden) {
++                        state = state.copy(
++                            presentationMode = SearchPresentationMode.Input,
++                            imePhase = SearchImePhase.Visible,
++                        )
++                    }
++                } else {
++                    val userCollapsedIme =
++                        intent.userInitiatedHide &&
++                            state.phase == SearchPhase.Active &&
++                            !state.pageReturnImeSuppressed &&
++                            state.imePhase == SearchImePhase.Visible
++
+                     state = state.copy(
+-                        imePhase = if (intent.visible) SearchImePhase.Visible else SearchImePhase.Hidden,
++                        presentationMode = if (userCollapsedIme) {
++                            SearchPresentationMode.Expanded
++                        } else {
++                            state.presentationMode
++                        },
++                        imePhase = SearchImePhase.Hidden,
+                     )
+                 }
+             }
+ 
+-            is SearchIntent.AutoKeyboardRequested -> {
+-                state = state.copy(
+-                    autoKeyboardRequested = intent.requested,
+-                    keyboardRequested = intent.requested &&
+-                        state.phase == SearchPhase.Active &&
+-                        !state.pageReturnImeSuppressed,
+-                )
++            SearchIntent.EnterInputMode -> {
++                if (state.phase != SearchPhase.Hidden) {
++                    state = state.copy(presentationMode = SearchPresentationMode.Input)
++                }
++            }
++
++            SearchIntent.EnterExpandedMode -> {
++                if (state.phase == SearchPhase.Active) {
++                    state = state.copy(
++                        presentationMode = SearchPresentationMode.Expanded,
++                        imePhase = if (state.imePhase == SearchImePhase.Visible) {
++                            SearchImePhase.Hiding
++                        } else {
++                            state.imePhase
++                        },
++                    )
++                }
+             }
+ 
+             SearchIntent.SuppressImeForPageReturn -> {
+-                state = state.copy(
+-                    keyboardRequested = false,
+-                    pageReturnImeSuppressed = true,
+-                )
++                // Suppression is transient page-navigation policy. Do not mutate the
++                // presentation target; a cancelled return can therefore resume correctly.
++                state = state.copy(pageReturnImeSuppressed = true)
+             }
+ 
+             SearchIntent.AllowImeAfterPageReturn -> {
+@@ -172,7 +220,10 @@
+             state.imePhase != SearchImePhase.Hiding &&
+             contentOverflowAboveImePx > collapseOverflowThresholdPx
+         ) {
+-            state = state.copy(imePhase = SearchImePhase.Hiding)
++            state = state.copy(
++                presentationMode = SearchPresentationMode.Expanded,
++                imePhase = SearchImePhase.Hiding,
++            )
+             effect = SearchPreScrollEffect.HideIme
+         }
+ 
+@@ -200,10 +251,14 @@
+         if (
+             visual > 0f &&
+             !imeVisible &&
++            state.presentationMode == SearchPresentationMode.Expanded &&
+             visual >= revealPullThresholdPx &&
+             state.imePhase != SearchImePhase.Showing
+         ) {
+-            state = state.copy(imePhase = SearchImePhase.Showing)
++            state = state.copy(
++                presentationMode = SearchPresentationMode.Input,
++                imePhase = SearchImePhase.Showing,
++            )
+             return SearchBoundaryEffect.RevealIme
+         }
+ 
+--- a/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
+@@ -83,6 +83,7 @@
+ import androidx.compose.ui.draw.rotate
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.ImageBitmap
+ import androidx.compose.ui.graphics.SolidColor
+@@ -165,6 +166,8 @@
+     val context = LocalContext.current
+     val interactionScope = rememberCoroutineScope()
+     val interactionState = coordinator.interaction
++    var searchFieldFocused by remember { mutableStateOf(false) }
++    var programmaticImeHidePending by remember { mutableStateOf(false) }
+ 
+     // Search keeps one fixed full-height result surface. IME insets only position the
+     // floating field; they never resize the result viewport. This removes the scroll-range
+@@ -219,11 +222,19 @@
+         }
+     }
+ 
+-    // Keep semantic IME state in the coordinator. The actual inset remains the source
+-    // of truth for rendering; the coordinator uses this phase only for single-fire
+-    // gesture transitions such as Visible -> Hiding and Hidden -> Showing.
++    // Keep actual IME visibility separate from Search's desired presentation mode.
++    // A system/user keyboard dismissal normally leaves the text field focused; app-driven
++    // hides mark programmaticImeHidePending first so they do not accidentally turn Input
++    // into Expanded.
+     LaunchedEffect(imeVisible) {
+-        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(imeVisible))
++        coordinator.dispatch(
++            SearchIntent.ImeVisibilityChanged(
++                visible = imeVisible,
++                userInitiatedHide =
++                    !imeVisible && searchFieldFocused && !programmaticImeHidePending,
++            ),
++        )
++        if (!imeVisible) programmaticImeHidePending = false
+     }
+ 
+     val prefixMatch = remember(query, targets) { matchSearchTargetPrefix(query, targets) }
+@@ -245,12 +256,14 @@
+ 
+     LaunchedEffect(requestKeyboard) {
+         if (requestKeyboard) {
++            programmaticImeHidePending = false
+             if (queryValue.text.isNotEmpty()) {
+                 queryValue = queryValue.copy(selection = TextRange(0, queryValue.text.length))
+             }
+             focusRequester.requestFocus()
+             keyboardController?.show()
+         } else {
++            programmaticImeHidePending = true
+             focusManager.clearFocus()
+             keyboardController?.hide()
+         }
+@@ -258,6 +271,7 @@
+ 
+     DisposableEffect(Unit) {
+         onDispose {
++            programmaticImeHidePending = true
+             focusManager.clearFocus()
+             keyboardController?.hide()
+         }
+@@ -293,6 +307,7 @@
+ 
+                 when (effect) {
+                     SearchPreScrollEffect.HideIme -> {
++                        programmaticImeHidePending = true
+                         focusManager.clearFocus()
+                         keyboardController?.hide()
+                     }
+@@ -339,6 +354,7 @@
+                                     strengthPercent = preferences.homeReturnHapticStrengthPercent,
+                                 )
+                             }
++                            programmaticImeHidePending = true
+                             focusManager.clearFocus()
+                             keyboardController?.hide()
+                         }
+@@ -351,6 +367,7 @@
+                                 strengthPercent = preferences.imeRevealHapticStrengthPercent,
+                             )
+                         }
++                        programmaticImeHidePending = false
+                         focusRequester.requestFocus()
+                         keyboardController?.show()
+                     }
+@@ -607,12 +624,24 @@
+                         coordinator.dispatch(SearchIntent.QueryChanged(value.text))
+                     },
+                     focusRequester = focusRequester,
++                    onFocusStateChanged = { focused ->
++                        searchFieldFocused = focused
++                        if (
++                            focused &&
++                            coordinator.state.phase == SearchPhase.Active &&
++                            !coordinator.state.pageReturnImeSuppressed
++                        ) {
++                            coordinator.dispatch(SearchIntent.EnterInputMode)
++                        }
++                    },
+                     height = searchFieldHeight,
+                     cornerRadius = searchFieldCornerRadius,
+                     backgroundColor = floatingSearchBarColor,
+                     onClear = {
+                         queryValue = TextFieldValue("")
+                         coordinator.dispatch(SearchIntent.QueryChanged(""))
++                        coordinator.dispatch(SearchIntent.EnterInputMode)
++                        programmaticImeHidePending = false
+                         focusRequester.requestFocus()
+                         keyboardController?.show()
+                     },
+@@ -620,6 +649,7 @@
+                         val matched = prefixMatch
+                         if (matched != null) {
+                             if (effectiveQuery.isNotEmpty()) {
++                                programmaticImeHidePending = true
+                                 keyboardController?.hide()
+                                 focusManager.clearFocus()
+                                 onSearchTarget(matched.target, effectiveQuery)
+@@ -627,6 +657,7 @@
+                         } else {
+                             val bestMatch = results.firstOrNull()
+                             if (trimmedQuery.isNotEmpty() && bestMatch != null) {
++                                programmaticImeHidePending = true
+                                 keyboardController?.hide()
+                                 focusManager.clearFocus()
+                                 onAppSelected(bestMatch)
+@@ -646,6 +677,7 @@
+                     modifier = Modifier
+                         .size(36.dp)
+                         .clickable {
++                            programmaticImeHidePending = true
+                             keyboardController?.hide()
+                             focusManager.clearFocus()
+                             onOpenSettings()
+@@ -696,6 +728,7 @@
+     queryValue: TextFieldValue,
+     onQueryChange: (TextFieldValue) -> Unit,
+     focusRequester: FocusRequester,
++    onFocusStateChanged: (Boolean) -> Unit,
+     onClear: () -> Unit,
+     onSearch: () -> Unit,
+     height: Dp = 44.dp,
+@@ -736,7 +769,8 @@
+                 onValueChange = onQueryChange,
+                 modifier = Modifier
+                     .fillMaxWidth()
+-                    .focusRequester(focusRequester),
++                    .focusRequester(focusRequester)
++                    .onFocusChanged { onFocusStateChanged(it.isFocused) },
+                 singleLine = true,
+                 textStyle = TextStyle(
+                     color = OnHomePrimary,
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+@@ -37,7 +37,6 @@
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+-import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.TransformOrigin
+@@ -65,7 +64,6 @@
+ import com.flower.launcher.ui.theme.SearchScrim
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+-import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.isActive
+ 
+@@ -500,14 +498,17 @@
+         closeSearch()
+     }
+ 
+-    LaunchedEffect(verticalTransition) {
+-        snapshotFlow {
++    // Search presentation is declarative: every fresh Search session targets Input,
++    // while this page-progress gate decides when that target may be realized as an IME.
++    // Because this is derived state rather than a one-shot event, activation ordering
++    // cannot drop the request.
++    val searchImePresentationReady by remember(verticalTransition, searchCoordinator) {
++        derivedStateOf {
+             verticalPosition.value >= KEYBOARD_TRIGGER_PROGRESS &&
+                 verticalTransition.searchLayerActive &&
++                searchCoordinator.state.phase == SearchPhase.Active &&
+                 !searchCoordinator.state.pageReturnImeSuppressed
+         }
+-            .distinctUntilChanged()
+-            .collect { searchCoordinator.dispatch(SearchIntent.AutoKeyboardRequested(it)) }
+     }
+ 
+     // A completed return should not poison the next Search entry. If a return
+@@ -593,8 +594,8 @@
+                 ).coerceAtLeast(0f)
+                 if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
+                     searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+-                    // SearchContent observes keyboardRequested=false and performs both
+-                    // focusManager.clearFocus() and keyboardController.hide().
++                    // The derived presentation gate becomes false; SearchContent then
++                    // clears focus and hides the IME without mutating the Input target.
+                 }
+             }
+ 
+@@ -833,10 +834,9 @@
+                     if (page == VerticalPage.Search) {
+                         searchCoordinator.dispatch(SearchIntent.ResumeActive)
+                         searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                        // Auto-keyboard may have evaluated while Search was Returning,
+-                        // where the coordinator correctly ignored it. Re-issue after
+-                        // Active is restored so IME follows a same-pointer reversal.
+-                        searchCoordinator.dispatch(SearchIntent.AutoKeyboardRequested(true))
++                        // Preserve the existing same-pointer reversal experience:
++                        // returning to Search explicitly targets Input again.
++                        searchCoordinator.dispatch(SearchIntent.EnterInputMode)
+                         searchCoordinator.onRelease(
+                             scope = scope,
+                             reboundDurationMs = launcherPreferences.searchReboundDurationMs,
+@@ -1127,6 +1127,7 @@
+                                 }
+                                 if (page == VerticalPage.Search) {
+                                     searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                                    searchCoordinator.dispatch(SearchIntent.EnterInputMode)
+                                 }
+                                 settleTo(page, startValue = latestPosition)
+                             }
+@@ -1143,6 +1144,7 @@
+                                     )
+                                     if (page == VerticalPage.Search) {
+                                         searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                                        searchCoordinator.dispatch(SearchIntent.EnterInputMode)
+                                     }
+                                     settleTo(page, startValue = latestPosition)
+                                 }
+@@ -1214,7 +1216,10 @@
+                     apps = searchApps,
+                     hiddenComponentKeys = appCustomizations.hiddenComponentKeys,
+                     preferences = searchPreferences,
+-                    requestKeyboard = searchCoordinator.state.keyboardRequested && !showSearchSettings,
++                    requestKeyboard =
++                        searchImePresentationReady &&
++                            searchCoordinator.state.presentationMode == SearchPresentationMode.Input &&
++                            !showSearchSettings,
+                     coordinator = searchCoordinator,
+                     reboundDurationMs = launcherPreferences.searchReboundDurationMs,
+                     onReturnHomeThreshold = {
+--- a/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt
++++ b/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt
+@@ -6,16 +6,91 @@
+ import org.junit.Test
+ 
+ class SearchCoordinatorTest {
+-    private fun activeCoordinator(query: String = ""): SearchCoordinator {
++    private fun activeCoordinator(
++        query: String = "",
++        expanded: Boolean = false,
++    ): SearchCoordinator {
+         val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
+         coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
+         coordinator.dispatch(SearchIntent.QueryChanged(query))
+         coordinator.dispatch(SearchIntent.ImeVisibilityChanged(false))
++        if (expanded) coordinator.dispatch(SearchIntent.EnterExpandedMode)
+         return coordinator
+     }
+ 
+-    @Test fun emptyQueryTopPullUsesTheSameImeRevealThreshold() {
++    @Test fun freshSearchSessionTargetsInputPresentation() {
++        val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
++
++        coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
++
++        assertEquals(SearchPhase.Active, coordinator.state.phase)
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++    }
++
++    @Test fun hiddenImeBeforeFirstShowDoesNotCollapseInputPresentation() {
++        val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
++        coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
++
++        coordinator.dispatch(
++            SearchIntent.ImeVisibilityChanged(
++                visible = false,
++                userInitiatedHide = true,
++            ),
++        )
++
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++    }
++
++    @Test fun userDismissedVisibleImeTransitionsToExpandedPresentation() {
++        val coordinator = activeCoordinator()
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        coordinator.dispatch(
++            SearchIntent.ImeVisibilityChanged(
++                visible = false,
++                userInitiatedHide = true,
++            ),
++        )
++
++        assertEquals(SearchPresentationMode.Expanded, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++    }
++
++    @Test fun programmaticImeHideDoesNotChangeInputPresentation() {
++        val coordinator = activeCoordinator()
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        coordinator.dispatch(
++            SearchIntent.ImeVisibilityChanged(
++                visible = false,
++                userInitiatedHide = false,
++            ),
++        )
++
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hidden, coordinator.state.imePhase)
++    }
++
++    @Test fun pageReturnSuppressionDoesNotDestroyInputTarget() {
+         val coordinator = activeCoordinator()
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++        coordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
++
++        coordinator.dispatch(
++            SearchIntent.ImeVisibilityChanged(
++                visible = false,
++                userInitiatedHide = true,
++            ),
++        )
++
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++        assertTrue(coordinator.state.pageReturnImeSuppressed)
++    }
++
++    @Test fun emptyQueryTopPullUsesTheSameImeRevealThreshold() {
++        val coordinator = activeCoordinator(expanded = true)
+ 
+         val effect = coordinator.onTopBoundaryDrag(
+             deltaY = 100f,
+@@ -25,12 +100,13 @@
+         )
+ 
+         assertEquals(SearchBoundaryEffect.RevealIme, effect)
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
+         assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
+         assertTrue(coordinator.interaction.rawOverscrollPx > 0f)
+     }
+ 
+     @Test fun nonEmptyQueryTopPullUsesTheSameImeRevealThreshold() {
+-        val coordinator = activeCoordinator("flower")
++        val coordinator = activeCoordinator(query = "flower", expanded = true)
+ 
+         val effect = coordinator.onTopBoundaryDrag(
+             deltaY = 100f,
+@@ -40,9 +116,40 @@
+         )
+ 
+         assertEquals(SearchBoundaryEffect.RevealIme, effect)
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
+         assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
+     }
+ 
++    @Test fun inputPresentationDoesNotFirePullRevealBeforeItBecomesExpanded() {
++        val coordinator = activeCoordinator()
++
++        val effect = coordinator.onTopBoundaryDrag(
++            deltaY = 100f,
++            imeVisible = false,
++            overscrollLimitPx = 1000f,
++            revealPullThresholdPx = 50f,
++        )
++
++        assertEquals(SearchBoundaryEffect.None, effect)
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
++    }
++
++    @Test fun nonEmptyUpScrollCollapseTargetsExpandedPresentation() {
++        val coordinator = activeCoordinator(query = "flower")
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(true))
++
++        val (_, effect) = coordinator.onPreScroll(
++            deltaY = -20f,
++            imeVisible = true,
++            contentOverflowAboveImePx = 200f,
++            collapseOverflowThresholdPx = 50f,
++        )
++
++        assertEquals(SearchPreScrollEffect.HideIme, effect)
++        assertEquals(SearchPresentationMode.Expanded, coordinator.state.presentationMode)
++        assertEquals(SearchImePhase.Hiding, coordinator.state.imePhase)
++    }
++
+     @Test fun emptyQueryDoesNotAcquireTheNonEmptyBottomReturnPath() {
+         val coordinator = activeCoordinator()
+ 
+@@ -57,7 +164,7 @@
+     }
+ 
+     @Test fun emptyQueryCanReverseAnExistingTopRubberBand() {
+-        val coordinator = activeCoordinator()
++        val coordinator = activeCoordinator(expanded = true)
+         coordinator.onTopBoundaryDrag(
+             deltaY = 100f,
+             imeVisible = true,
+@@ -78,7 +185,7 @@
+     }
+ 
+     @Test fun clearingQueryDoesNotResetTheSharedTopPullState() {
+-        val coordinator = activeCoordinator("flower")
++        val coordinator = activeCoordinator(query = "flower", expanded = true)
+         coordinator.onTopBoundaryDrag(
+             deltaY = 80f,
+             imeVisible = true,
+@@ -91,31 +198,14 @@
+ 
+         assertEquals(before, coordinator.interaction.rawOverscrollPx, 0.0001f)
+     }
+-    @Test fun earlyAutoKeyboardRequestIsReplayedWhenSearchSessionBecomesActive() {
+-        val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
+ 
+-        // The page transition can cross the keyboard trigger before the Search session
+-        // lifecycle effect has promoted the coordinator from Hidden to Active.
+-        coordinator.dispatch(SearchIntent.AutoKeyboardRequested(true))
+-
+-        assertTrue(coordinator.state.autoKeyboardRequested)
+-        assertEquals(false, coordinator.state.keyboardRequested)
++    @Test fun aNewSessionAlwaysResetsThePresentationTargetToInput() {
++        val coordinator = activeCoordinator(expanded = true)
++        coordinator.dispatch(SearchIntent.SessionActiveChanged(false))
+ 
+         coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
+ 
++        assertEquals(SearchPresentationMode.Input, coordinator.state.presentationMode)
+         assertEquals(SearchPhase.Active, coordinator.state.phase)
+-        assertTrue(coordinator.state.keyboardRequested)
+     }
+-
+-    @Test fun pendingAutoKeyboardRequestStillHonorsPageReturnSuppression() {
+-        val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
+-
+-        coordinator.dispatch(SearchIntent.AutoKeyboardRequested(true))
+-        coordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+-        coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
+-
+-        assertTrue(coordinator.state.autoKeyboardRequested)
+-        assertEquals(false, coordinator.state.keyboardRequested)
+-    }
+-
+ }
+--- a/verification/run_current_checks.sh
++++ b/verification/run_current_checks.sh
+@@ -6,4 +6,5 @@
+ # A small compatibility smoke check. This does NOT replace the behavioral tests.
+ python3 verification/verify_v61_gesture_coordinator.py
+ python3 verification/verify_v70_unified_search_pull.py
++python3 verification/verify_v72_search_presentation_mode.py
+ bash ./gradlew :app:testDebugUnitTest :app:assembleDebug

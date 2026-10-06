@@ -1,0 +1,21 @@
+verify_source_invariants.py
+PASS: 27 transition/blur constants unchanged
+PASS: 9 visual/gesture functions and easing curve unchanged
+PASS: 14 resource/build/settings files byte-identical
+PASS: literal dp/sp dimensions unchanged in four edited UI files
+PASS: 202202 drawer alpha interpolation checks (real-number model, not GPU pixel comparison)
+LIMIT: this does not compile Kotlin or validate lifecycle, device rendering, power, or frame times.
+exit_code=0
+
+verify_preserved_ui.py
+PASS: 78 original files unchanged; edits limited to five existing Kotlin files
+PASS: full transition controller, wallpaper blur host, easing and all tail helpers unchanged
+PASS: LauncherRoot: 5 render blocks byte-identical
+PASS: LauncherRoot: 2 pointer handlers byte-identical
+PASS: AllAppsContent: 0 render blocks byte-identical
+PASS: AllAppsContent: 3 pointer handlers byte-identical
+PASS: drawer layout, menu content, index gestures and item rendering unchanged
+LIMIT: source equivalence is not Android compilation, device rendering or a frame-time measurement
+exit_code=0
+
+Android build/JUnit: NOT RUN (Gradle distribution unavailable; network unreachable).

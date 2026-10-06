@@ -1,0 +1,19 @@
+V68 verification result
+
+PASS: V61 coordinator source check: 12/12.
+PASS: 135 original files byte-identical; 4 existing Kotlin files intentionally changed.
+PASS: Three LauncherRoot pointer-input handler blocks unchanged.
+PASS: Search/Drawer content and gesture/session controllers unchanged.
+PASS: Kotlin lexical delimiter balance (not compilation).
+
+BLOCKED: Gradle wrapper download failed with java.net.SocketException: Network is unreachable.
+Gradle URL: https://mirrors.aliyun.com/macports/distfiles/gradle/gradle-8.13-bin.zip
+Attempted: :app:testDebugUnitTest :app:assembleDebug --no-daemon
+No Kotlin compilation, JUnit run, APK, device rendering, GPU/power or frame-time validation completed.
+
+Historical verify_source_invariants.py and verify_preserved_ui.py failed: they assume a ZIP without
+an enclosing project directory and target older changes. Their failures are not counted as passes.
+Historical verify_v65_full_home_cache.py intentionally requires minute-based full cache invalidation;
+it is obsolete for V68 and was not used as an acceptance gate.
+
+Read README_V68_START_HERE.md for scope, wallpaper source limitations, and device acceptance steps.

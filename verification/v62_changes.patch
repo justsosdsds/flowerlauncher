@@ -1,0 +1,2094 @@
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -55,4 +55,5 @@
+     debugImplementation(libs.androidx.compose.ui.tooling)
+ 
+     testImplementation(libs.junit)
++    testImplementation(libs.kotlinx.coroutines.test)
+ }
+--- a/app/src/main/java/com/flower/launcher/home/HomeLayoutRepository.kt
++++ b/app/src/main/java/com/flower/launcher/home/HomeLayoutRepository.kt
+@@ -2,35 +2,6 @@
+ 
+ import android.content.Context
+ import android.util.Base64
+-
+-data class HomeFolder(
+-    val id: Long,
+-    val name: String,
+-    val appKeys: List<String>,
+-)
+-
+-data class HomePreferences(
+-    val pinnedAppKeys: List<String> = emptyList(),
+-    val removedAppKeys: Set<String> = emptySet(),
+-    val folders: List<HomeFolder> = emptyList(),
+-    val showClock: Boolean = false,
+-    val showSearchBar: Boolean = false,
+-    val gridColumns: Int = 4,
+-    val layoutLocked: Boolean = false,
+-    val pageCount: Int = 1,
+-    val appPageByKey: Map<String, Int> = emptyMap(),
+-    val folderPageById: Map<Long, Int> = emptyMap(),
+-    val lastHomePage: Int = 0,
+-    val clockFont: Int = 0,
+-    val clockFontWeight: Int = 300,
+-    val clockFontSizeSp: Int = 78,
+-    val clockScaleXPercent: Int = 100,
+-    val clockScaleYPercent: Int = 100,
+-    val clockTimeColor: Int = 0xFFFFFFFF.toInt(),
+-    val clockDateColor: Int = 0xE6FFFFFF.toInt(),
+-    val clockOffsetX: Int = 0,
+-    val clockOffsetY: Int = 0,
+-)
+ 
+ class HomeLayoutRepository(context: Context) {
+     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+@@ -52,6 +23,15 @@
+         val pageCount = prefs.getInt(KEY_PAGE_COUNT, 1)
+             .coerceAtLeast(maxAssignedPage + 1)
+             .coerceIn(1, MAX_HOME_PAGES)
++        val defaultPage = restoredDefaultHomePage(
++            savedDefault = if (prefs.contains(KEY_DEFAULT_HOME_PAGE)) prefs.getInt(KEY_DEFAULT_HOME_PAGE, 0) else null,
++            legacyLastPage = prefs.getInt(KEY_LAST_HOME_PAGE, 0),
++            pageCount = pageCount,
++        )
++        if (!prefs.contains(KEY_DEFAULT_HOME_PAGE)) {
++            // Persist the migration immediately; later visits cannot redefine it.
++            prefs.edit().putInt(KEY_DEFAULT_HOME_PAGE, defaultPage).apply()
++        }
+         return HomePreferences(
+             pinnedAppKeys = pinned,
+             removedAppKeys = prefs.getStringSet(KEY_REMOVED_APPS, emptySet()).orEmpty(),
+@@ -66,6 +46,7 @@
+                 folder.id to (folderPages[folder.id]?.coerceIn(0, pageCount - 1) ?: 0)
+             },
+             lastHomePage = prefs.getInt(KEY_LAST_HOME_PAGE, 0).coerceIn(0, pageCount - 1),
++            defaultHomePage = defaultPage,
+             clockFont = prefs.getInt(KEY_CLOCK_FONT, 0).coerceIn(0, CLOCK_FONTS.size - 1),
+             clockFontWeight = prefs.getInt(KEY_CLOCK_FONT_WEIGHT, 300).coerceIn(100, 900),
+             clockFontSizeSp = prefs.getInt(KEY_CLOCK_FONT_SIZE, 78).coerceIn(40, 160),
+@@ -108,6 +89,7 @@
+             .putString(KEY_APP_PAGES, encodeStringIntMap(value.appPageByKey))
+             .putString(KEY_FOLDER_PAGES, encodeLongIntMap(value.folderPageById))
+             .putInt(KEY_LAST_HOME_PAGE, value.lastHomePage.coerceIn(0, pageCount - 1))
++            .putInt(KEY_DEFAULT_HOME_PAGE, value.defaultHomePage.coerceIn(0, pageCount - 1))
+             .putInt(KEY_CLOCK_FONT, value.clockFont.coerceIn(0, CLOCK_FONTS.size - 1))
+             .putInt(KEY_CLOCK_FONT_WEIGHT, value.clockFontWeight.coerceIn(100, 900))
+             .putInt(KEY_CLOCK_FONT_SIZE, value.clockFontSizeSp.coerceIn(40, 160))
+@@ -183,6 +165,7 @@
+         const val KEY_APP_PAGES = "app_pages"
+         const val KEY_FOLDER_PAGES = "folder_pages"
+         const val KEY_LAST_HOME_PAGE = "last_home_page"
++        const val KEY_DEFAULT_HOME_PAGE = "default_home_page"
+         const val KEY_CLOCK_FONT = "clock_font"
+         const val KEY_CLOCK_FONT_WEIGHT = "clock_font_weight"
+         const val KEY_CLOCK_FONT_SIZE = "clock_font_size_sp"
+--- a/app/src/main/java/com/flower/launcher/home/HomePageEditor.kt
++++ b/app/src/main/java/com/flower/launcher/home/HomePageEditor.kt
+@@ -25,20 +25,37 @@
+         .filterValues { it != removed }
+         .mapValues { (_, page) -> if (page > removed) page - 1 else page }
+     val newCount = count - 1
+-    val newLast = when {
+-        preferences.lastHomePage == removed -> (removed - 1).coerceAtLeast(0)
+-        preferences.lastHomePage > removed -> preferences.lastHomePage - 1
+-        else -> preferences.lastHomePage
+-    }.coerceIn(0, newCount - 1)
++    val newLast = pageAfterRemoval(preferences.lastHomePage, removed, newCount)
+     return preferences.copy(
+         pageCount = newCount,
+         appPageByKey = appPages,
+         folderPageById = folderPages,
+         lastHomePage = newLast,
++        defaultHomePage = pageAfterRemoval(preferences.defaultHomePage, removed, newCount),
+     )
+ }
+ 
+ fun setDefaultHomePage(preferences: HomePreferences, index: Int): HomePreferences {
+     val count = preferences.pageCount.coerceIn(1, MAX_HOME_PAGES)
+-    return preferences.copy(lastHomePage = index.coerceIn(0, count - 1))
++    return preferences.copy(defaultHomePage = index.coerceIn(0, count - 1))
+ }
++
++/** Keep the same logical page when an earlier page is deleted. */
++private fun pageAfterRemoval(page: Int, removed: Int, newCount: Int): Int = when {
++    page == removed -> (removed - 1).coerceAtLeast(0)
++    page > removed -> page - 1
++    else -> page
++}.coerceIn(0, newCount - 1)
++
++/** V61 had one ambiguous page value; preserve it once as the user's default. */
++internal fun restoredDefaultHomePage(savedDefault: Int?, legacyLastPage: Int, pageCount: Int): Int =
++    (savedDefault ?: legacyLastPage).coerceIn(0, pageCount.coerceIn(1, MAX_HOME_PAGES) - 1)
++
++/** Visiting a page must never change the default. */
++fun visitHomePage(preferences: HomePreferences, index: Int): HomePreferences =
++    preferences.copy(lastHomePage = index.coerceIn(0, preferences.pageCount.coerceIn(1, MAX_HOME_PAGES) - 1))
++
++/** An explicit navigation command, independent of persisted visit history. */
++data class HomePageRequest(val page: Int, val sequence: Long = 0L) {
++    fun navigateTo(page: Int): HomePageRequest = HomePageRequest(page, sequence + 1)
++}
+--- a/app/src/main/java/com/flower/launcher/home/HomePreferences.kt
++++ b/app/src/main/java/com/flower/launcher/home/HomePreferences.kt
+@@ -0,0 +1,32 @@
++package com.flower.launcher.home
++
++data class HomeFolder(
++    val id: Long,
++    val name: String,
++    val appKeys: List<String>,
++)
++
++data class HomePreferences(
++    val pinnedAppKeys: List<String> = emptyList(),
++    val removedAppKeys: Set<String> = emptySet(),
++    val folders: List<HomeFolder> = emptyList(),
++    val showClock: Boolean = false,
++    val showSearchBar: Boolean = false,
++    val gridColumns: Int = 4,
++    val layoutLocked: Boolean = false,
++    val pageCount: Int = 1,
++    val appPageByKey: Map<String, Int> = emptyMap(),
++    val folderPageById: Map<Long, Int> = emptyMap(),
++    val lastHomePage: Int = 0,
++    val defaultHomePage: Int = 0,
++    val clockFont: Int = 0,
++    val clockFontWeight: Int = 300,
++    val clockFontSizeSp: Int = 78,
++    val clockScaleXPercent: Int = 100,
++    val clockScaleYPercent: Int = 100,
++    val clockTimeColor: Int = 0xFFFFFFFF.toInt(),
++    val clockDateColor: Int = 0xE6FFFFFF.toInt(),
++    val clockOffsetX: Int = 0,
++    val clockOffsetY: Int = 0,
++)
++
+--- a/app/src/main/java/com/flower/launcher/settings/DebouncedPreferenceWriter.kt
++++ b/app/src/main/java/com/flower/launcher/settings/DebouncedPreferenceWriter.kt
+@@ -0,0 +1,47 @@
++package com.flower.launcher.settings
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++
++/**
++ * Main-thread confined. UI state changes immediately; only persistence is delayed.
++ * flush() is synchronous so lifecycle/disposal does not depend on a cancelled scope.
++ * The supplied save function should enqueue persistence (SharedPreferences.apply).
++ */
++internal class DebouncedPreferenceWriter<T>(
++    private val scope: CoroutineScope,
++    initialValue: T,
++    private val delayMillis: Long = 300L,
++    private val save: (T) -> Unit,
++) {
++    private var savedValue = initialValue
++    private var latestValue = initialValue
++    private var job: Job? = null
++
++    fun submit(value: T) {
++        if (value == latestValue) return
++        latestValue = value
++        job?.cancel()
++        job = null
++        if (latestValue == savedValue) return
++        job = scope.launch {
++            delay(delayMillis)
++            persistLatest()
++        }
++    }
++
++    fun flush() {
++        job?.cancel()
++        job = null
++        persistLatest()
++    }
++
++    private fun persistLatest() {
++        if (latestValue == savedValue) return
++        val value = latestValue
++        save(value)
++        savedValue = value
++    }
++}
+--- a/app/src/main/java/com/flower/launcher/ui/GestureCoordinator.kt
++++ b/app/src/main/java/com/flower/launcher/ui/GestureCoordinator.kt
+@@ -41,19 +41,22 @@
+ 
+     private var session: VerticalGestureSession = VerticalGestureSession.Idle
+     private var searchReturnVelocityTracker: VelocityTracker? = null
++    private var pointerGeneration = 0L
+ 
+     /** Register the Search pointer before any bottom-threshold commit can occur. */
+     fun beginSearchBottomPointer(
+         pointerId: Long,
+         searchSessionId: Long,
+         eligible: Boolean,
+-    ) {
+-        if (!eligible) return
++    ): Long? {
++        if (!eligible) return null
++        pointerGeneration++
+         session = VerticalGestureSession.SearchBottomCandidate(
+             pointerId = pointerId,
+             searchSessionId = searchSessionId,
+         )
+         searchReturnVelocityTracker = null
++        return pointerGeneration
+     }
+ 
+     /**
+@@ -185,16 +188,19 @@
+      */
+     fun cancelSearchPointer(
+         pointerId: Long,
++        searchSessionId: Long,
+         currentPagePosition: Float,
++        generation: Long,
+     ): SearchReturnGestureFrame {
++        if (generation != pointerGeneration) return SearchReturnGestureFrame.None
+         return when (val current = session) {
+             is VerticalGestureSession.SearchBottomCandidate -> {
+-                if (current.pointerId == pointerId) clearSession()
++                if (current.pointerId == pointerId && current.searchSessionId == searchSessionId) clearSession()
+                 SearchReturnGestureFrame.None
+             }
+ 
+             is VerticalGestureSession.SearchToHome -> {
+-                if (current.pointerId != pointerId) {
++                if (current.pointerId != pointerId || current.searchSessionId != searchSessionId) {
+                     SearchReturnGestureFrame.None
+                 } else {
+                     val position = if (current.originEstablished) {
+@@ -217,6 +223,7 @@
+     }
+ 
+     fun reset() {
++        pointerGeneration++
+         clearSession()
+     }
+ 
+--- a/app/src/main/java/com/flower/launcher/ui/HomeContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/HomeContent.kt
+@@ -25,6 +25,8 @@
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.key
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+@@ -46,6 +48,7 @@
+ import com.flower.launcher.apps.InstalledApp
+ import com.flower.launcher.home.CLOCK_FONTS
+ import com.flower.launcher.home.HomePreferences
++import com.flower.launcher.home.HomePageRequest
+ import com.flower.launcher.ui.theme.OnHomePrimary
+ import com.flower.launcher.ui.theme.OnHomeSecondary
+ import java.time.format.DateTimeFormatter
+@@ -54,23 +57,26 @@
+ @Composable
+ fun HomeContent(
+     preferences: HomePreferences,
++    pageRequest: HomePageRequest,
+     onLongPressEmptyArea: () -> Unit,
+     onCurrentPageChanged: (Int) -> Unit,
+     modifier: Modifier = Modifier,
+ ) {
+     val pageCount = preferences.pageCount.coerceIn(1, 9)
+     val pagerState = rememberPagerState(
+-        initialPage = preferences.lastHomePage.coerceIn(0, pageCount - 1),
++        initialPage = pageRequest.page.coerceIn(0, pageCount - 1),
+         pageCount = { pageCount },
+     )
+ 
+-    LaunchedEffect(preferences.lastHomePage, pageCount) {
+-        val target = preferences.lastHomePage.coerceIn(0, pageCount - 1)
++    LaunchedEffect(pageRequest, pageCount) {
++        val target = pageRequest.page.coerceIn(0, pageCount - 1)
+         if (pagerState.currentPage != target) pagerState.scrollToPage(target)
+     }
+ 
+-    LaunchedEffect(pagerState.currentPage) {
+-        onCurrentPageChanged(pagerState.currentPage)
++    val reportPage by rememberUpdatedState(onCurrentPageChanged)
++    LaunchedEffect(pagerState) {
++        snapshotFlow { pagerState.settledPage to pagerState.isScrollInProgress }
++            .collect { (page, scrolling) -> if (!scrolling) reportPage(page) }
+     }
+ 
+     Column(
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+@@ -13,12 +13,11 @@
+ import android.view.ViewTreeObserver
+ import android.widget.Toast
+ import androidx.activity.compose.BackHandler
+-import androidx.compose.animation.core.Animatable
+-import androidx.compose.animation.core.Easing
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
+ import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.Spring
+ import androidx.compose.animation.core.spring
+-import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.gestures.detectVerticalDragGestures
+@@ -60,19 +59,18 @@
+ import com.flower.launcher.apps.AppDrawerCatalog
+ import com.flower.launcher.apps.InstalledApp
+ import com.flower.launcher.home.HomeFolder
+-import com.flower.launcher.home.HomeLayoutRepository
++import com.flower.launcher.home.HomePageRequest
++import com.flower.launcher.home.visitHomePage
+ import com.flower.launcher.home.HomePreferences
+-import com.flower.launcher.search.SearchPreferencesRepository
+ import com.flower.launcher.search.SearchTarget
+-import com.flower.launcher.search.SearchTargetRepository
+ import com.flower.launcher.search.SearchTargetGroup
+ import com.flower.launcher.settings.LauncherPreferences
+-import com.flower.launcher.settings.LauncherPreferencesRepository
+ import com.flower.launcher.ui.theme.SearchScrim
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.isActive
+ 
+ @Composable
+ fun LauncherRoot(
+@@ -95,22 +93,31 @@
+     val context = LocalContext.current
+     val activity = remember(context) { context.findActivity() }
+     val haptic = LocalHapticFeedback.current
+-    val homeRepository = remember(context) { HomeLayoutRepository(context.applicationContext) }
+-    var homePreferences by remember { mutableStateOf(homeRepository.load()) }
+-    var currentHomePage by remember { mutableStateOf(homePreferences.lastHomePage) }
++    val settingsState = remember(context, scope) { LauncherSettingsState(context, scope) }
++    val homePreferences = settingsState.home
++    val searchPreferences = settingsState.search
++    val searchTargets = settingsState.targets
++    val searchGroups = settingsState.groups
++    val expandedSearchGroups = settingsState.expandedGroups
++    val launcherPreferences = settingsState.launcher
++    var currentHomePage by remember { mutableStateOf(homePreferences.defaultHomePage) }
++    var homePageRequest by remember { mutableStateOf(HomePageRequest(homePreferences.defaultHomePage)) }
+     var showDesktopSheet by remember { mutableStateOf(false) }
+     var activeDialog by remember { mutableStateOf<DesktopDialog?>(null) }
+-    val searchRepository = remember(context) { SearchPreferencesRepository(context.applicationContext) }
+-    var searchPreferences by remember { mutableStateOf(searchRepository.load()) }
+-    val searchTargetRepository = remember(context) { SearchTargetRepository(context.applicationContext) }
+-    var searchTargets by remember { mutableStateOf(searchTargetRepository.load()) }
+-    var searchGroups by remember { mutableStateOf(searchTargetRepository.loadGroups()) }
+-    var expandedSearchGroups by remember { mutableStateOf(searchTargetRepository.loadExpandedGroups()) }
+     val appCustomizationRepository = remember(context) { AppCustomizationRepository(context.applicationContext) }
+     var appCustomizations by remember { mutableStateOf(appCustomizationRepository.load()) }
+     var showSearchSettings by remember { mutableStateOf(false) }
+-    val launcherSettingsRepository = remember(context) { LauncherPreferencesRepository(context.applicationContext) }
+-    var launcherPreferences by remember { mutableStateOf(launcherSettingsRepository.load()) }
++
++    DisposableEffect(activity, settingsState) {
++        val observer = LifecycleEventObserver { _, event ->
++            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) settingsState.flush()
++        }
++        activity?.lifecycle?.addObserver(observer)
++        onDispose {
++            activity?.lifecycle?.removeObserver(observer)
++            settingsState.flush()
++        }
++    }
+     val uiScale = launcherPreferences.uiScalePercent.coerceIn(70, 110) / 100f
+     var showLauncherSettings by remember { mutableStateOf(false) }
+     var launcherSettingsInitialSection by remember { mutableStateOf<LauncherSettingsSection?>(null) }
+@@ -123,6 +130,9 @@
+                 .getOrDefault(DrawerSortMode.Name),
+         )
+     }
++    DisposableEffect(showSearchSettings, showLauncherSettings, showDesktopSheet, activeDialog) {
++        onDispose { settingsState.flush() }
++    }
+     val editScale by animateFloatAsState(
+         targetValue = if (showDesktopSheet) 0.985f else 1f,
+         animationSpec = spring(dampingRatio = 0.82f, stiffness = Spring.StiffnessMediumLow),
+@@ -131,8 +141,12 @@
+ 
+     fun updateHomePreferences(value: HomePreferences) {
+         if (homePreferences == value) return
+-        homePreferences = value
+-        homeRepository.save(value)
++        if (value.defaultHomePage != settingsState.home.defaultHomePage) {
++            homePageRequest = homePageRequest.navigateTo(value.defaultHomePage)
++        } else if (value.pageCount != settingsState.home.pageCount) {
++            homePageRequest = homePageRequest.navigateTo(value.lastHomePage)
++        }
++        settingsState.home = value
+     }
+ 
+     fun addAppToHome(app: InstalledApp, page: Int = currentHomePage) {
+@@ -160,6 +174,7 @@
+             ),
+         )
+         currentHomePage = targetPage
++        homePageRequest = homePageRequest.navigateTo(targetPage)
+     }
+ 
+     fun moveHomeApp(app: InstalledApp, direction: Int) {
+@@ -196,35 +211,30 @@
+ 
+     fun updateSearchPreferences(value: com.flower.launcher.search.SearchPreferences) {
+         if (searchPreferences == value) return
+-        searchPreferences = value
+-        searchRepository.save(value)
++        settingsState.search = value
+     }
+ 
+     fun updateSearchTargets(value: List<SearchTarget>) {
+         if (searchTargets == value) return
+-        searchTargets = value
+-        searchTargetRepository.save(value)
++        settingsState.targets = value
+     }
+ 
+     fun updateSearchGroups(value: List<SearchTargetGroup>) {
+         if (searchGroups == value) return
+-        searchGroups = value
+-        searchTargetRepository.saveGroups(value)
++        settingsState.groups = value
+     }
+ 
+     fun toggleSearchGroup(groupId: String) {
+-        expandedSearchGroups = if (groupId in expandedSearchGroups) {
+-            expandedSearchGroups - groupId
++        settingsState.expandedGroups = if (groupId in settingsState.expandedGroups) {
++            settingsState.expandedGroups - groupId
+         } else {
+-            expandedSearchGroups + groupId
+-        }
+-        searchTargetRepository.saveExpandedGroups(expandedSearchGroups)
++            settingsState.expandedGroups + groupId
++        }
+     }
+ 
+     fun updateLauncherPreferences(value: LauncherPreferences) {
+         if (launcherPreferences == value) return
+-        launcherPreferences = value
+-        launcherSettingsRepository.save(value)
++        settingsState.launcher = value
+     }
+ 
+     fun setAppHidden(app: InstalledApp, hidden: Boolean) {
+@@ -329,6 +339,12 @@
+     val drawerLayerActive = verticalTransition.drawerLayerActive
+     val searchCoordinator = rememberSearchCoordinator()
+     val gestureCoordinator = rememberGestureCoordinator()
++    DisposableEffect(verticalTransition, gestureCoordinator) {
++        onDispose {
++            gestureCoordinator.reset()
++            verticalTransition.dispose()
++        }
++    }
+     val searchOwnsForeground by remember(verticalTransition) {
+         derivedStateOf {
+             verticalTransition.searchLayerActive && (
+@@ -440,6 +456,8 @@
+ 
+     LaunchedEffect(resetSignal) {
+         if (resetSignal > 0) {
++            gestureCoordinator.reset()
++            homePageRequest = homePageRequest.navigateTo(settingsState.home.defaultHomePage)
+             verticalTransition.reset()
+             drawerHiddenOnly = false
+             // The system Home gesture (the bottom "pill"/white bar) delivers a new
+@@ -585,147 +603,172 @@
+                 }
+             }
+ 
+-            detectVerticalDragGestures(
+-                onDragStart = {
+-                    drawerFlingJob?.cancel()
+-                    verticalTransition.beginInteractive()
+-                    velocityTracker = VelocityTracker()
+-                    latestPosition = verticalPosition.value.coerceIn(-1f, 1f)
+-                    gestureStartPage = verticalTransition.stablePage
+-                    drawerScrollEngaged = false
+-                },
+-                onVerticalDrag = { change, dragAmount ->
+-                    velocityTracker.addPosition(change.uptimeMillis, change.position)
+-                    change.consume()
+-
+-                    // V41: a Home -> Search drag may reverse before Search ever becomes
+-                    // the stable page. The compact return visual must start at the
+-                    // direction reversal itself, not after the Search settle finishes.
+-                    if (dragAmount < 0f && latestPosition > VerticalPage.Home.anchor) {
+-                        verticalTransition.beginSearchReturn(latestPosition)
+-                    }
+-
+-                    var remainingDy = dragAmount
+-
+-                    if (remainingDy < 0f) {
+-                        // Finger up: the page transition owns the movement until All Apps
+-                        // is fully open. Any overflow then becomes forward grid scrolling.
+-                        if (latestPosition > VerticalPage.AllApps.anchor) {
+-                            remainingDy -= consumeTransitionDelta(remainingDy)
++            var interactionOwner: Long? = null
++            try {
++                detectVerticalDragGestures(
++                    onDragStart = {
++                        drawerFlingJob?.cancel()
++                        interactionOwner = verticalTransition.beginInteractive()
++                        velocityTracker = VelocityTracker()
++                        latestPosition = verticalPosition.value.coerceIn(-1f, 1f)
++                        gestureStartPage = verticalTransition.stablePage
++                        drawerScrollEngaged = false
++                    },
++                    onVerticalDrag = drag@{ change, dragAmount ->
++                        val owned = interactionOwner ?: return@drag
++                        if (!verticalTransition.ownsInteraction(owned)) return@drag
++                        velocityTracker.addPosition(change.uptimeMillis, change.position)
++                        change.consume()
++
++                        // V41: a Home -> Search drag may reverse before Search ever becomes
++                        // the stable page. The compact return visual must start at the
++                        // direction reversal itself, not after the Search settle finishes.
++                        if (dragAmount < 0f && latestPosition > VerticalPage.Home.anchor) {
++                            verticalTransition.beginSearchReturn(latestPosition)
+                         }
+-                        if (remainingDy < 0f && latestPosition <= VerticalPage.AllApps.anchor) {
+-                            val consumedScroll = drawerGridState.dispatchRawDelta(-remainingDy)
+-                            if (consumedScroll > 0f) drawerScrollEngaged = true
++
++                        var remainingDy = dragAmount
++
++                        if (remainingDy < 0f) {
++                            // Finger up: the page transition owns the movement until All Apps
++                            // is fully open. Any overflow then becomes forward grid scrolling.
++                            if (latestPosition > VerticalPage.AllApps.anchor) {
++                                remainingDy -= consumeTransitionDelta(remainingDy)
++                            }
++                            if (remainingDy < 0f && latestPosition <= VerticalPage.AllApps.anchor) {
++                                val consumedScroll = drawerGridState.dispatchRawDelta(-remainingDy)
++                                if (consumedScroll > 0f) drawerScrollEngaged = true
++                            }
++                        } else if (remainingDy > 0f) {
++                            // Finger down while the drawer is fully open: unwind the grid first.
++                            // Once it reaches the top, feed the unconsumed distance back into
++                            // All Apps -> Home (and, if the finger keeps going, Home -> Search).
++                            if (latestPosition <= VerticalPage.AllApps.anchor && drawerGridState.canScrollBackward) {
++                                val requestedScroll = -remainingDy
++                                val consumedScroll = drawerGridState.dispatchRawDelta(requestedScroll)
++                                val consumedFingerDy = -consumedScroll
++                                remainingDy = (remainingDy - consumedFingerDy).coerceAtLeast(0f)
++                                if (kotlin.math.abs(consumedScroll) > 0f) drawerScrollEngaged = true
++                            }
++                            if (remainingDy > 0f && !drawerGridState.canScrollBackward) {
++                                consumeTransitionDelta(remainingDy)
++                            }
+                         }
+-                    } else if (remainingDy > 0f) {
+-                        // Finger down while the drawer is fully open: unwind the grid first.
+-                        // Once it reaches the top, feed the unconsumed distance back into
+-                        // All Apps -> Home (and, if the finger keeps going, Home -> Search).
+-                        if (latestPosition <= VerticalPage.AllApps.anchor && drawerGridState.canScrollBackward) {
+-                            val requestedScroll = -remainingDy
+-                            val consumedScroll = drawerGridState.dispatchRawDelta(requestedScroll)
+-                            val consumedFingerDy = -consumedScroll
+-                            remainingDy = (remainingDy - consumedFingerDy).coerceAtLeast(0f)
+-                            if (kotlin.math.abs(consumedScroll) > 0f) drawerScrollEngaged = true
++
++                        if (dragAmount < 0f) {
++                            maybeHideImeForSearchReturn()
+                         }
+-                        if (remainingDy > 0f && !drawerGridState.canScrollBackward) {
+-                            consumeTransitionDelta(remainingDy)
++                    },
++                    onDragCancel = {
++                        val owned = interactionOwner
++                        interactionOwner = null
++                        if (owned != null && scope.isActive && verticalTransition.ownsInteraction(owned)) {
++                            val page = if (drawerGridState.canScrollBackward && latestPosition <= VerticalPage.AllApps.anchor) {
++                                VerticalPage.AllApps
++                            } else {
++                                verticalTargetForRelease(
++                                    position = latestPosition,
++                                    velocityY = 0f,
++                                    velocityThreshold = openVelocityPx,
++                                    settleThreshold = settleThreshold,
++                                )
++                            }
++                            if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                            settleTo(page, startValue = latestPosition)
+                         }
+-                    }
+-
+-                    if (dragAmount < 0f) {
+-                        maybeHideImeForSearchReturn()
+-                    }
+-                },
+-                onDragCancel = {
+-                    val page = if (drawerGridState.canScrollBackward && latestPosition <= VerticalPage.AllApps.anchor) {
+-                        VerticalPage.AllApps
+-                    } else {
+-                        verticalTargetForRelease(
+-                            position = latestPosition,
+-                            velocityY = 0f,
+-                            velocityThreshold = openVelocityPx,
+-                            settleThreshold = settleThreshold,
+-                        )
+-                    }
+-                    if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                    settleTo(page, startValue = latestPosition)
+-                },
+-                onDragEnd = {
+-                    val velocityY = runCatching {
+-                        velocityTracker.calculateVelocity().y
+-                    }.getOrDefault(0f)
+-
+-                    val drawerOwnsRelease =
+-                        latestPosition <= VerticalPage.AllApps.anchor && drawerGridState.canScrollBackward
+-                    val page = if (drawerOwnsRelease) {
+-                        VerticalPage.AllApps
+-                    } else {
+-                        verticalTargetForRelease(
+-                            position = latestPosition,
+-                            velocityY = velocityY,
+-                            velocityThreshold = openVelocityPx,
+-                            settleThreshold = settleThreshold,
+-                        )
+-                    }
+-
+-                    if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
+-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+-                    }
+-                    if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                    settleTo(page, startValue = latestPosition)
+-
+-                    // V46: the root detector owns normal drawer scrolling too, so preserve
+-                    // release momentum in both directions. A finger-up fling scrolls the
+-                    // grid forward; a finger-down fling scrolls it backward toward the top.
+-                    // Once the grid hits an edge the fling ends instead of leaking into a
+-                    // second page transition after the finger has already been released.
+-                    val drawerFlingTriggerPx = (openVelocityPx * 0.35f)
+-                        .coerceAtLeast(DRAWER_HANDOFF_FLING_STOP_VELOCITY_PX * 2f)
+-                    val initialGridVelocity = -velocityY
+-                    val canFlingGrid = if (initialGridVelocity > 0f) {
+-                        drawerGridState.canScrollForward
+-                    } else {
+-                        drawerGridState.canScrollBackward
+-                    }
+-                    if (
+-                        page == VerticalPage.AllApps &&
+-                        drawerScrollEngaged &&
+-                        kotlin.math.abs(initialGridVelocity) >= drawerFlingTriggerPx &&
+-                        canFlingGrid
+-                    ) {
+-                        drawerFlingJob?.cancel()
+-                        drawerFlingJob = scope.launch {
+-                            drawerGridState.scroll {
+-                                var velocity = initialGridVelocity
+-                                var lastFrameNanos = System.nanoTime()
+-                                while (
+-                                    kotlin.math.abs(velocity) > DRAWER_HANDOFF_FLING_STOP_VELOCITY_PX &&
+-                                    (if (velocity > 0f) {
+-                                        drawerGridState.canScrollForward
+-                                    } else {
+-                                        drawerGridState.canScrollBackward
+-                                    })
+-                                ) {
+-                                    delay(DRAWER_HANDOFF_FLING_FRAME_MS)
+-                                    val now = System.nanoTime()
+-                                    val dtSeconds = ((now - lastFrameNanos) / 1_000_000_000.0)
+-                                        .toFloat()
+-                                        .coerceIn(0f, 0.05f)
+-                                    lastFrameNanos = now
+-                                    val requested = velocity * dtSeconds
+-                                    val consumed = scrollBy(requested)
+-                                    if (kotlin.math.abs(requested - consumed) > 0.5f) break
+-                                    val decay = kotlin.math.exp(
+-                                        (-DRAWER_HANDOFF_FLING_FRICTION * dtSeconds).toDouble(),
+-                                    ).toFloat()
+-                                    velocity *= decay
++                    },
++                    onDragEnd = end@{
++                        val owned = interactionOwner ?: return@end
++                        interactionOwner = null
++                        if (!scope.isActive || !verticalTransition.ownsInteraction(owned)) return@end
++                        val velocityY = runCatching {
++                            velocityTracker.calculateVelocity().y
++                        }.getOrDefault(0f)
++
++                        val drawerOwnsRelease =
++                            latestPosition <= VerticalPage.AllApps.anchor && drawerGridState.canScrollBackward
++                        val page = if (drawerOwnsRelease) {
++                            VerticalPage.AllApps
++                        } else {
++                            verticalTargetForRelease(
++                                position = latestPosition,
++                                velocityY = velocityY,
++                                velocityThreshold = openVelocityPx,
++                                settleThreshold = settleThreshold,
++                            )
++                        }
++
++                        if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
++                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++                        }
++                        if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                        settleTo(page, startValue = latestPosition)
++
++                        // V46: the root detector owns normal drawer scrolling too, so preserve
++                        // release momentum in both directions. A finger-up fling scrolls the
++                        // grid forward; a finger-down fling scrolls it backward toward the top.
++                        // Once the grid hits an edge the fling ends instead of leaking into a
++                        // second page transition after the finger has already been released.
++                        val drawerFlingTriggerPx = (openVelocityPx * 0.35f)
++                            .coerceAtLeast(DRAWER_HANDOFF_FLING_STOP_VELOCITY_PX * 2f)
++                        val initialGridVelocity = -velocityY
++                        val canFlingGrid = if (initialGridVelocity > 0f) {
++                            drawerGridState.canScrollForward
++                        } else {
++                            drawerGridState.canScrollBackward
++                        }
++                        if (
++                            page == VerticalPage.AllApps &&
++                            drawerScrollEngaged &&
++                            kotlin.math.abs(initialGridVelocity) >= drawerFlingTriggerPx &&
++                            canFlingGrid
++                        ) {
++                            drawerFlingJob?.cancel()
++                            drawerFlingJob = scope.launch {
++                                drawerGridState.scroll {
++                                    var velocity = initialGridVelocity
++                                    var lastFrameNanos = System.nanoTime()
++                                    while (
++                                        kotlin.math.abs(velocity) > DRAWER_HANDOFF_FLING_STOP_VELOCITY_PX &&
++                                        (if (velocity > 0f) {
++                                            drawerGridState.canScrollForward
++                                        } else {
++                                            drawerGridState.canScrollBackward
++                                        })
++                                    ) {
++                                        delay(DRAWER_HANDOFF_FLING_FRAME_MS)
++                                        val now = System.nanoTime()
++                                        val dtSeconds = ((now - lastFrameNanos) / 1_000_000_000.0)
++                                            .toFloat()
++                                            .coerceIn(0f, 0.05f)
++                                        lastFrameNanos = now
++                                        val requested = velocity * dtSeconds
++                                        val consumed = scrollBy(requested)
++                                        if (kotlin.math.abs(requested - consumed) > 0.5f) break
++                                        val decay = kotlin.math.exp(
++                                            (-DRAWER_HANDOFF_FLING_FRICTION * dtSeconds).toDouble(),
++                                        ).toFloat()
++                                        velocity *= decay
++                                    }
+                                 }
+                             }
+                         }
+-                    }
+-                },
+-            )
++                    },
++                )
++            } finally {
++                val owned = interactionOwner
++                interactionOwner = null
++                if (owned != null && scope.isActive && verticalTransition.ownsInteraction(owned)) {
++                    val page = verticalTargetForRelease(
++                        position = latestPosition,
++                        velocityY = 0f,
++                        velocityThreshold = openVelocityPx,
++                        settleThreshold = settleThreshold,
++                    )
++                    if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                    settleTo(page, startValue = latestPosition)
++                }
++            }
+         }
+     }
+ 
+@@ -755,21 +798,22 @@
+                     searchCoordinator.state.hasQuery &&
+                         searchCoordinator.state.phase == SearchPhase.Active
+ 
+-                gestureCoordinator.beginSearchBottomPointer(
++                val pointerGeneration = gestureCoordinator.beginSearchBottomPointer(
+                     pointerId = down.id.value,
+                     searchSessionId = searchSessionId,
+                     eligible = eligibleAtDown,
+                 )
+-                if (!eligibleAtDown) return@awaitEachGesture
++                if (pointerGeneration == null) return@awaitEachGesture
+ 
+                 var settled = false
++                var interactionOwner: Long? = null
+ 
+                 fun applyFrame(
+                     frame: SearchReturnGestureFrame,
+                     consume: (() -> Unit)? = null,
+                 ) {
+                     frame.beginInteractiveAt?.let { start ->
+-                        verticalTransition.beginInteractive()
++                        interactionOwner = verticalTransition.beginInteractive()
+                         verticalTransition.beginSearchReturn(start)
+                     }
+                     if (frame.consumePointer) consume?.invoke()
+@@ -807,38 +851,44 @@
+                     settled = true
+                 }
+ 
+-                while (!settled) {
+-                    // Final pass lets SearchContent commit the rubber-band threshold
+-                    // first. GestureCoordinator can therefore observe a threshold commit
+-                    // and a pointer-up in the same event without any armed/release race.
+-                    val event = awaitPointerEvent(PointerEventPass.Final)
+-                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+-                    val frame = gestureCoordinator.onSearchPointerFrame(
++                try {
++                    while (!settled) {
++                        // Final pass lets SearchContent commit the rubber-band threshold
++                        // first. GestureCoordinator can therefore observe a threshold commit
++                        // and a pointer-up in the same event without any armed/release race.
++                        val event = awaitPointerEvent(PointerEventPass.Final)
++                        if (interactionOwner?.let { !verticalTransition.ownsInteraction(it) } == true) break
++                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
++                        val frame = gestureCoordinator.onSearchPointerFrame(
++                            pointerId = down.id.value,
++                            searchSessionId = searchSessionId,
++                            position = change.position,
++                            uptimeMillis = change.uptimeMillis,
++                            pressed = change.pressed,
++                            currentPagePosition = verticalPosition.value.coerceIn(0f, 1f),
++                            dragDistancePx = dragDistancePx,
++                            touchSlopPx = touchSlop,
++                            settleThreshold = settleThreshold,
++                            openVelocityPx = openVelocityPx,
++                        )
++                        applyFrame(frame) { change.consume() }
++                        if (!change.pressed) break
++                    }
++                } finally {
++                    // Cancellation of awaitPointerEvent skips ordinary code after the loop.
++                    // Clear ownership even when the UI scope itself is already cancelled.
++                    val frame = gestureCoordinator.cancelSearchPointer(
+                         pointerId = down.id.value,
+                         searchSessionId = searchSessionId,
+-                        position = change.position,
+-                        uptimeMillis = change.uptimeMillis,
+-                        pressed = change.pressed,
+                         currentPagePosition = verticalPosition.value.coerceIn(0f, 1f),
+-                        dragDistancePx = dragDistancePx,
+-                        touchSlopPx = touchSlop,
+-                        settleThreshold = settleThreshold,
+-                        openVelocityPx = openVelocityPx,
++                        generation = pointerGeneration,
+                     )
+-                    applyFrame(frame) { change.consume() }
+-                    if (!change.pressed) break
+-                }
+-
+-                if (!settled) {
+-                    // Pointer cancellation / disappearance is resolved by the session
+-                    // owner itself. A committed Search->Home return settles Home; an
+-                    // uncommitted candidate is simply discarded.
+-                    applyFrame(
+-                        gestureCoordinator.cancelSearchPointer(
+-                            pointerId = down.id.value,
+-                            currentPagePosition = verticalPosition.value.coerceIn(0f, 1f),
+-                        ),
+-                    )
++                    val stillOwnsPage = interactionOwner?.let(verticalTransition::ownsInteraction) ?: true
++                    if (!settled && scope.isActive && !verticalTransition.isDisposed &&
++                        stillOwnsPage && searchCoordinator.state.sessionId == searchSessionId
++                    ) {
++                        applyFrame(frame)
++                    }
+                 }
+             }
+         }
+@@ -994,6 +1044,7 @@
+         ) {
+             HomeContent(
+                 preferences = homePreferences,
++                pageRequest = homePageRequest,
+                 onLongPressEmptyArea = {
+                     if (
+                         verticalTransition.targetPage == VerticalPage.Home &&
+@@ -1004,9 +1055,7 @@
+                 },
+                 onCurrentPageChanged = { page ->
+                     currentHomePage = page
+-                    if (homePreferences.lastHomePage != page) {
+-                        updateHomePreferences(homePreferences.copy(lastHomePage = page))
+-                    }
++                    settingsState.home = visitHomePage(settingsState.home, page)
+                 },
+             )
+         }
+@@ -1053,109 +1102,136 @@
+                             it.addPosition(down.uptimeMillis, down.position)
+                         }
+ 
+-                        while (true) {
+-                            val event = awaitPointerEvent(PointerEventPass.Initial)
+-                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+-                            if (!change.pressed) break
+-
+-                            velocityTracker.addPosition(change.uptimeMillis, change.position)
+-                            val dy = change.position.y - lastY
+-                            lastY = change.position.y
+-                            accumulatedY += dy
+-
+-                            if (direction == 0) {
+-                                direction = when {
+-                                    accumulatedY > touchSlop -> 1
+-                                    accumulatedY < -touchSlop -> -1
+-                                    else -> 0
++                        var interactionOwner: Long? = null
++                        var finished = false
++                        try {
++                            while (true) {
++                                val event = awaitPointerEvent(PointerEventPass.Initial)
++                                if (interactionOwner?.let { !verticalTransition.ownsInteraction(it) } == true) {
++                                    mode = 0
++                                    break
+                                 }
+-                                if (direction != 0) {
+-                                    gestureStartPosition = verticalPosition.value.coerceIn(-1f, 1f)
+-                                    latestPosition = gestureStartPosition
+-                                    gestureStartTransitionOffset = transitionPullOffset.value
+-                                    gestureStartPage = verticalTransition.stablePage
+-
+-                                    val stableSearch =
+-                                        gestureStartPage == VerticalPage.Search &&
+-                                            gestureStartPosition >= SEARCH_STABLE_PROGRESS &&
+-                                            kotlin.math.abs(gestureStartTransitionOffset) < 1f
+-
+-                                    mode = if (stableSearch && direction == 1) {
+-                                        verticalTransition.cancelRebound()
+-                                        1
+-                                    } else {
+-                                        if (direction < 0 && gestureStartPosition > VerticalPage.Home.anchor) {
+-                                            verticalTransition.beginSearchReturn(gestureStartPosition)
++                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
++                                if (!change.pressed) break
++
++                                velocityTracker.addPosition(change.uptimeMillis, change.position)
++                                val dy = change.position.y - lastY
++                                lastY = change.position.y
++                                accumulatedY += dy
++
++                                if (direction == 0) {
++                                    direction = when {
++                                        accumulatedY > touchSlop -> 1
++                                        accumulatedY < -touchSlop -> -1
++                                        else -> 0
++                                    }
++                                    if (direction != 0) {
++                                        gestureStartPosition = verticalPosition.value.coerceIn(-1f, 1f)
++                                        latestPosition = gestureStartPosition
++                                        gestureStartTransitionOffset = transitionPullOffset.value
++                                        gestureStartPage = verticalTransition.stablePage
++
++                                        val stableSearch =
++                                            gestureStartPage == VerticalPage.Search &&
++                                                gestureStartPosition >= SEARCH_STABLE_PROGRESS &&
++                                                kotlin.math.abs(gestureStartTransitionOffset) < 1f
++
++                                        mode = if (stableSearch && direction == 1) {
++                                            interactionOwner = verticalTransition.beginSearchPull()
++                                            1
++                                        } else {
++                                            if (direction < 0 && gestureStartPosition > VerticalPage.Home.anchor) {
++                                                verticalTransition.beginSearchReturn(gestureStartPosition)
++                                            }
++                                            interactionOwner = verticalTransition.beginInteractive()
++                                            verticalTransition.clearSearchPull()
++                                            2
+                                         }
+-                                        verticalTransition.beginInteractive()
+-                                        verticalTransition.clearSearchPull()
+-                                        2
++                                    }
++                                }
++
++                                when (mode) {
++                                    1 -> {
++                                        change.consume()
++                                        rawPullDistance = (rawPullDistance + dy).coerceAtLeast(0f)
++                                        verticalTransition.snapSearchPullTo(
++                                            rubberBandDistance(rawPullDistance, searchPullLimitPx),
++                                        )
++                                    }
++
++                                    2 -> {
++                                        change.consume()
++                                        if (dy < 0f && latestPosition > VerticalPage.Home.anchor) {
++                                            verticalTransition.beginSearchReturn(latestPosition)
++                                        }
++                                        latestPosition = (
++                                            gestureStartPosition + accumulatedY / dragDistancePx
++                                        ).coerceIn(-1f, 1f)
++                                        if (
++                                            dy < 0f &&
++                                            verticalTransition.returningFromSearch &&
++                                            !searchCoordinator.state.pageReturnImeSuppressed
++                                        ) {
++                                            val returnedDistancePx = (
++                                                (verticalTransition.searchReturnStartPosition - latestPosition) *
++                                                    dragDistancePx
++                                            ).coerceAtLeast(0f)
++                                            if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
++                                                searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
++                                            }
++                                        }
++                                        val liveOffset = (
++                                            gestureStartTransitionOffset +
++                                                signedRubberBandDistance(accumulatedY, homePullLimitPx)
++                                        ).coerceIn(-homePullLimitPx, homePullLimitPx)
++                                        verticalTransition.snapTo(
++                                            positionValue = latestPosition,
++                                            pullOffset = liveOffset,
++                                        )
+                                     }
+                                 }
+                             }
+ 
+                             when (mode) {
+                                 1 -> {
+-                                    change.consume()
+-                                    rawPullDistance = (rawPullDistance + dy).coerceAtLeast(0f)
+-                                    verticalTransition.snapSearchPullTo(
+-                                        rubberBandDistance(rawPullDistance, searchPullLimitPx),
++                                    reboundSearchPull()
++                                }
++
++                                2 -> {
++                                    val velocityY = runCatching {
++                                        velocityTracker.calculateVelocity().y
++                                    }.getOrDefault(0f)
++                                    val page = verticalTargetForRelease(
++                                        position = latestPosition,
++                                        velocityY = velocityY,
++                                        velocityThreshold = openVelocityPx,
++                                        settleThreshold = settleThreshold,
+                                     )
+-                                }
+-
+-                                2 -> {
+-                                    change.consume()
+-                                    if (dy < 0f && latestPosition > VerticalPage.Home.anchor) {
+-                                        verticalTransition.beginSearchReturn(latestPosition)
++                                    if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
++                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                     }
+-                                    latestPosition = (
+-                                        gestureStartPosition + accumulatedY / dragDistancePx
+-                                    ).coerceIn(-1f, 1f)
+-                                    if (
+-                                        dy < 0f &&
+-                                        verticalTransition.returningFromSearch &&
+-                                        !searchCoordinator.state.pageReturnImeSuppressed
+-                                    ) {
+-                                        val returnedDistancePx = (
+-                                            (verticalTransition.searchReturnStartPosition - latestPosition) *
+-                                                dragDistancePx
+-                                        ).coerceAtLeast(0f)
+-                                        if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
+-                                            searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+-                                        }
+-                                    }
+-                                    val liveOffset = (
+-                                        gestureStartTransitionOffset +
+-                                            signedRubberBandDistance(accumulatedY, homePullLimitPx)
+-                                    ).coerceIn(-homePullLimitPx, homePullLimitPx)
+-                                    verticalTransition.snapTo(
+-                                        positionValue = latestPosition,
+-                                        pullOffset = liveOffset,
+-                                    )
++                                    if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                                    settleTo(page, startValue = latestPosition)
+                                 }
+                             }
+-                        }
+-
+-                        when (mode) {
+-                            1 -> {
+-                                if (searchPullOffset.value > 0f) reboundSearchPull()
+-                            }
+-
+-                            2 -> {
+-                                val velocityY = runCatching {
+-                                    velocityTracker.calculateVelocity().y
+-                                }.getOrDefault(0f)
+-                                val page = verticalTargetForRelease(
+-                                    position = latestPosition,
+-                                    velocityY = velocityY,
+-                                    velocityThreshold = openVelocityPx,
+-                                    settleThreshold = settleThreshold,
+-                                )
+-                                if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
+-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++                            finished = true
++                        } finally {
++                            if (!finished && scope.isActive && !verticalTransition.isDisposed) {
++                                val owned = interactionOwner
++                                if (owned != null && verticalTransition.ownsInteraction(owned)) {
++                                    if (mode == 1) {
++                                        reboundSearchPull()
++                                    } else {
++                                        val page = verticalTargetForRelease(
++                                            position = latestPosition,
++                                            velocityY = 0f,
++                                            velocityThreshold = openVelocityPx,
++                                            settleThreshold = settleThreshold,
++                                        )
++                                        if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
++                                        settleTo(page, startValue = latestPosition)
++                                    }
+                                 }
+-                                if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                                settleTo(page, startValue = latestPosition)
+                             }
+                         }
+                     }
+@@ -1610,228 +1686,6 @@
+     if (visibleDistance <= 0f || limit <= 0f) return 0f
+     val clamped = visibleDistance.coerceAtMost(limit * 0.999f)
+     return (clamped * limit) / (limit - clamped)
+-}
+-
+-private val FastStartSoftFinishEasing = Easing { fraction ->
+-    // Selected rebound curve: ease-out quartic.
+-    // It covers more distance immediately after release, then eases into the
+-    // resting position while preserving the configured total duration.
+-    val t = fraction.coerceIn(0f, 1f)
+-    val inverse = 1f - t
+-    1f - inverse * inverse * inverse * inverse
+-}
+-
+-
+-private enum class VerticalPage(val anchor: Float) {
+-    AllApps(-1f),
+-    Home(0f),
+-    Search(1f),
+-}
+-
+-private class VerticalPageTransitionController(
+-    private val scope: kotlinx.coroutines.CoroutineScope,
+-) {
+-    val position = Animatable(VerticalPage.Home.anchor)
+-    val transitionPullOffset = Animatable(0f)
+-    val searchPullOffset = Animatable(0f)
+-
+-    var targetPage by mutableStateOf(VerticalPage.Home)
+-        private set
+-    var stablePage by mutableStateOf(VerticalPage.Home)
+-        private set
+-    var searchLayerActive by mutableStateOf(false)
+-        private set
+-    var drawerLayerActive by mutableStateOf(false)
+-        private set
+-
+-    // True only for the Search -> Home exit path (including a cancelled return
+-    // animating back to Search). Keeping this separate from stablePage avoids a
+-    // visual pop when Home -> Search finishes and stablePage becomes Search.
+-    var returningFromSearch by mutableStateOf(false)
+-        private set
+-
+-    // V41: compact return can begin from any positive Search-side progress, not
+-    // only from a fully settled Search at +1. Normalizing exit progress against
+-    // this snapshot keeps the reversal continuous with no instant fade jump.
+-    var searchReturnStartPosition by mutableStateOf(VerticalPage.Search.anchor)
+-        private set
+-
+-    private var settleJob: Job? = null
+-    private var liveSnapJob: Job? = null
+-    private var pendingLivePosition = VerticalPage.Home.anchor
+-    private var pendingLivePullOffset = 0f
+-    private var liveSnapVersion = 0L
+-    private var searchPullJob: Job? = null
+-    private var reboundJob: Job? = null
+-
+-    fun beginSearchReturn(positionValue: Float = position.value) {
+-        val positivePosition = positionValue.coerceIn(VerticalPage.Home.anchor, VerticalPage.Search.anchor)
+-        if (positivePosition <= VerticalPage.Home.anchor || returningFromSearch) return
+-        searchReturnStartPosition = positivePosition
+-        returningFromSearch = true
+-    }
+-
+-    fun searchReturnProgress(positionValue: Float = position.value): Float {
+-        if (!returningFromSearch) return 0f
+-        val start = searchReturnStartPosition.coerceAtLeast(0.001f)
+-        val current = positionValue.coerceIn(VerticalPage.Home.anchor, VerticalPage.Search.anchor)
+-        return ((start - current) / start).coerceIn(0f, 1f)
+-    }
+-
+-    fun beginInteractive() {
+-        settleJob?.cancel()
+-        liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+-        // Both sibling pages stay renderable during an interactive gesture so the
+-        // signed position can cross Home without waiting for composition/state swaps.
+-        searchLayerActive = true
+-        drawerLayerActive = true
+-    }
+-
+-    fun cancelRebound() {
+-        reboundJob?.cancel()
+-    }
+-
+-    fun snapTo(positionValue: Float, pullOffset: Float) {
+-        searchLayerActive = true
+-        drawerLayerActive = true
+-
+-        // Pointer events can arrive faster than two Animatable.snapTo calls can finish.
+-        // Cancelling/restarting a coroutine for every move creates a race where rapid
+-        // Home -> All Apps drags can temporarily stop applying live positions. Keep one
+-        // worker and coalesce intermediate events to the newest requested frame instead.
+-        pendingLivePosition = positionValue.coerceIn(-1f, 1f)
+-        pendingLivePullOffset = pullOffset
+-        liveSnapVersion++
+-        if (liveSnapJob?.isActive == true) return
+-
+-        liveSnapJob = scope.launch {
+-            var appliedVersion = Long.MIN_VALUE
+-            while (appliedVersion != liveSnapVersion) {
+-                val version = liveSnapVersion
+-                val nextPosition = pendingLivePosition
+-                val nextPullOffset = pendingLivePullOffset
+-                position.snapTo(nextPosition)
+-                transitionPullOffset.snapTo(nextPullOffset)
+-                appliedVersion = version
+-            }
+-        }
+-    }
+-
+-    fun clearSearchPull() {
+-        searchPullJob?.cancel()
+-        searchPullJob = scope.launch {
+-            searchPullOffset.snapTo(0f)
+-        }
+-    }
+-
+-    fun snapSearchPullTo(value: Float) {
+-        searchPullJob?.cancel()
+-        searchPullJob = scope.launch {
+-            searchPullOffset.snapTo(value.coerceAtLeast(0f))
+-        }
+-    }
+-
+-    fun settle(
+-        page: VerticalPage,
+-        startValue: Float? = null,
+-        reboundDurationMs: Int,
+-        durationOverrideMs: Int? = null,
+-    ) {
+-        val effectiveStart = startValue ?: position.value
+-        if (
+-            page == VerticalPage.Home &&
+-            effectiveStart > VerticalPage.Home.anchor &&
+-            (stablePage == VerticalPage.Search || returningFromSearch)
+-        ) {
+-            beginSearchReturn(effectiveStart)
+-        }
+-
+-        targetPage = page
+-        settleJob?.cancel()
+-        liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+-
+-        when (page) {
+-            VerticalPage.Search -> searchLayerActive = true
+-            VerticalPage.AllApps -> drawerLayerActive = true
+-            VerticalPage.Home -> {
+-                // Keep whichever page(s) are currently visible alive until the settle
+-                // reaches Home, otherwise a partially visible layer would disappear.
+-            }
+-        }
+-
+-        val duration = durationOverrideMs?.coerceIn(80, 600)
+-            ?: reboundDurationMs.coerceIn(160, 600)
+-        settleJob = scope.launch {
+-            startValue?.let {
+-                position.snapTo(it.coerceIn(-1f, 1f))
+-            }
+-
+-            kotlinx.coroutines.coroutineScope {
+-                launch {
+-                    position.animateTo(
+-                        targetValue = page.anchor,
+-                        animationSpec = tween(
+-                            durationMillis = duration,
+-                            easing = FastStartSoftFinishEasing,
+-                        ),
+-                    )
+-                }
+-                launch {
+-                    transitionPullOffset.animateTo(
+-                        targetValue = 0f,
+-                        animationSpec = tween(
+-                            durationMillis = duration,
+-                            easing = FastStartSoftFinishEasing,
+-                        ),
+-                    )
+-                }
+-            }
+-
+-            stablePage = page
+-            targetPage = page
+-            searchLayerActive = page == VerticalPage.Search
+-            drawerLayerActive = page == VerticalPage.AllApps
+-            returningFromSearch = false
+-            searchReturnStartPosition = VerticalPage.Search.anchor
+-            if (page != VerticalPage.Search) {
+-                searchPullOffset.snapTo(0f)
+-            }
+-        }
+-    }
+-
+-    fun reboundSearchPull(reboundDurationMs: Int) {
+-        reboundJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob = scope.launch {
+-            searchPullOffset.animateTo(
+-                targetValue = 0f,
+-                animationSpec = tween(
+-                    durationMillis = reboundDurationMs.coerceIn(160, 600),
+-                    easing = FastStartSoftFinishEasing,
+-                ),
+-            )
+-        }
+-    }
+-
+-    suspend fun reset() {
+-        settleJob?.cancel()
+-        liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+-        targetPage = VerticalPage.Home
+-        stablePage = VerticalPage.Home
+-        position.snapTo(VerticalPage.Home.anchor)
+-        transitionPullOffset.snapTo(0f)
+-        searchPullOffset.snapTo(0f)
+-        searchLayerActive = false
+-        drawerLayerActive = false
+-        returningFromSearch = false
+-        searchReturnStartPosition = VerticalPage.Search.anchor
+-    }
+ }
+ 
+ private fun verticalTargetForRelease(
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherSettingsScreen.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherSettingsScreen.kt
+@@ -383,12 +383,12 @@
+         ) {
+             Column(Modifier.weight(1f)) {
+                 Text("第 ${index + 1} 页", color = OnHomePrimary, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+-                if (preferences.lastHomePage == index) {
++                if (preferences.defaultHomePage == index) {
+                     Text("默认主页", color = Color(0xFF8ED9A7), fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
+                 }
+             }
+             TextButton(
+-                enabled = preferences.lastHomePage != index,
++                enabled = preferences.defaultHomePage != index,
+                 onClick = { onChange(setDefaultHomePage(preferences, index)) },
+             ) { Text("设为默认") }
+             TextButton(
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherSettingsState.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherSettingsState.kt
+@@ -0,0 +1,67 @@
++package com.flower.launcher.ui
++
++import android.content.Context
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import com.flower.launcher.home.HomeLayoutRepository
++import com.flower.launcher.home.HomePreferences
++import com.flower.launcher.search.SearchPreferences
++import com.flower.launcher.search.SearchPreferencesRepository
++import com.flower.launcher.search.SearchTarget
++import com.flower.launcher.search.SearchTargetGroup
++import com.flower.launcher.search.SearchTargetRepository
++import com.flower.launcher.settings.DebouncedPreferenceWriter
++import com.flower.launcher.settings.LauncherPreferences
++import com.flower.launcher.settings.LauncherPreferencesRepository
++import kotlinx.coroutines.CoroutineScope
++
++/** Owns settings snapshots and their persistence; never retains an Activity. */
++internal class LauncherSettingsState(context: Context, scope: CoroutineScope) {
++    private val homeRepository = HomeLayoutRepository(context.applicationContext)
++    private val searchRepository = SearchPreferencesRepository(context.applicationContext)
++    private val targetRepository = SearchTargetRepository(context.applicationContext)
++    private val launcherRepository = LauncherPreferencesRepository(context.applicationContext)
++
++    private var homeValue by mutableStateOf(homeRepository.load())
++    private var searchValue by mutableStateOf(searchRepository.load())
++    private var targetsValue by mutableStateOf(targetRepository.load())
++    private var groupsValue by mutableStateOf(targetRepository.loadGroups())
++    private var expandedValue by mutableStateOf(targetRepository.loadExpandedGroups())
++    private var launcherValue by mutableStateOf(launcherRepository.load())
++
++    private val homeWriter = DebouncedPreferenceWriter(scope, homeValue, save = homeRepository::save)
++    private val searchWriter = DebouncedPreferenceWriter(scope, searchValue, save = searchRepository::save)
++    private val targetsWriter = DebouncedPreferenceWriter(scope, targetsValue, save = targetRepository::save)
++    private val groupsWriter = DebouncedPreferenceWriter(scope, groupsValue, save = targetRepository::saveGroups)
++    private val expandedWriter = DebouncedPreferenceWriter(scope, expandedValue, save = targetRepository::saveExpandedGroups)
++    private val launcherWriter = DebouncedPreferenceWriter(scope, launcherValue, save = launcherRepository::save)
++
++    var home: HomePreferences
++        get() = homeValue
++        set(value) { homeValue = value; homeWriter.submit(value) }
++    var search: SearchPreferences
++        get() = searchValue
++        set(value) { searchValue = value; searchWriter.submit(value) }
++    var targets: List<SearchTarget>
++        get() = targetsValue
++        set(value) { targetsValue = value; targetsWriter.submit(value) }
++    var groups: List<SearchTargetGroup>
++        get() = groupsValue
++        set(value) { groupsValue = value; groupsWriter.submit(value) }
++    var expandedGroups: Set<String>
++        get() = expandedValue
++        set(value) { expandedValue = value; expandedWriter.submit(value) }
++    var launcher: LauncherPreferences
++        get() = launcherValue
++        set(value) { launcherValue = value; launcherWriter.submit(value) }
++
++    fun flush() {
++        homeWriter.flush()
++        searchWriter.flush()
++        targetsWriter.flush()
++        groupsWriter.flush()
++        expandedWriter.flush()
++        launcherWriter.flush()
++    }
++}
+--- a/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
+@@ -1,4 +1,6 @@
+ package com.flower.launcher.ui
++
++import kotlinx.coroutines.isActive
+ 
+ import android.os.VibrationEffect
+ import android.os.Vibrator
+@@ -376,7 +378,22 @@
+             .pointerInput(queryLocked, interactionState) {
+                 awaitEachGesture {
+                     awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++                    val sessionId = coordinator.state.sessionId
+                     if (queryLocked) coordinator.beginInteractive()
++                    try {
++                        do {
++                            val event = awaitPointerEvent(PointerEventPass.Final)
++                        } while (event.changes.any { it.pressed })
++                    } finally {
++                        // An interrupted touch can cancel an existing rebound without
++                        // producing a fling. Resume it only for the same live session.
++                        if (queryLocked && interactionScope.isActive &&
++                            coordinator.state.sessionId == sessionId &&
++                            coordinator.state.phase == SearchPhase.Active
++                        ) {
++                            coordinator.onRelease(interactionScope, reboundDurationMs)
++                        }
++                    }
+                 }
+             }
+             // Keep the Search result viewport stable while IME animates. Navigation-bar
+--- a/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt
++++ b/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt
+@@ -0,0 +1,268 @@
++package com.flower.launcher.ui
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.Easing
++import androidx.compose.animation.core.tween
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++
++private val FastStartSoftFinishEasing = Easing { fraction ->
++    // Selected rebound curve: ease-out quartic.
++    // It covers more distance immediately after release, then eases into the
++    // resting position while preserving the configured total duration.
++    val t = fraction.coerceIn(0f, 1f)
++    val inverse = 1f - t
++    1f - inverse * inverse * inverse * inverse
++}
++
++
++internal enum class VerticalPage(val anchor: Float) {
++    AllApps(-1f),
++    Home(0f),
++    Search(1f),
++}
++
++internal class VerticalPageTransitionController(
++    private val scope: kotlinx.coroutines.CoroutineScope,
++) {
++    val position = Animatable(VerticalPage.Home.anchor)
++    val transitionPullOffset = Animatable(0f)
++    val searchPullOffset = Animatable(0f)
++
++    var targetPage by mutableStateOf(VerticalPage.Home)
++        private set
++    var stablePage by mutableStateOf(VerticalPage.Home)
++        private set
++    var searchLayerActive by mutableStateOf(false)
++        private set
++    var drawerLayerActive by mutableStateOf(false)
++        private set
++
++    // True only for the Search -> Home exit path (including a cancelled return
++    // animating back to Search). Keeping this separate from stablePage avoids a
++    // visual pop when Home -> Search finishes and stablePage becomes Search.
++    var returningFromSearch by mutableStateOf(false)
++        private set
++
++    // V41: compact return can begin from any positive Search-side progress, not
++    // only from a fully settled Search at +1. Normalizing exit progress against
++    // this snapshot keeps the reversal continuous with no instant fade jump.
++    var searchReturnStartPosition by mutableStateOf(VerticalPage.Search.anchor)
++        private set
++
++    private var settleJob: Job? = null
++    private var liveSnapJob: Job? = null
++    private var pendingLivePosition = VerticalPage.Home.anchor
++    private var pendingLivePullOffset = 0f
++    private var liveSnapVersion = 0L
++    private var searchPullJob: Job? = null
++    private var reboundJob: Job? = null
++    private var interactionGeneration = 0L
++    private var interactive = false
++    var isDisposed = false
++        private set
++
++    fun ownsInteraction(generation: Long): Boolean =
++        !isDisposed && interactive && generation == interactionGeneration
++
++    fun beginSearchReturn(positionValue: Float = position.value) {
++        val positivePosition = positionValue.coerceIn(VerticalPage.Home.anchor, VerticalPage.Search.anchor)
++        if (positivePosition <= VerticalPage.Home.anchor || returningFromSearch) return
++        searchReturnStartPosition = positivePosition
++        returningFromSearch = true
++    }
++
++    fun searchReturnProgress(positionValue: Float = position.value): Float {
++        if (!returningFromSearch) return 0f
++        val start = searchReturnStartPosition.coerceAtLeast(0.001f)
++        val current = positionValue.coerceIn(VerticalPage.Home.anchor, VerticalPage.Search.anchor)
++        return ((start - current) / start).coerceIn(0f, 1f)
++    }
++
++    fun beginInteractive(): Long {
++        check(!isDisposed)
++        interactive = true
++        interactionGeneration++
++        settleJob?.cancel()
++        liveSnapJob?.cancel()
++        searchPullJob?.cancel()
++        reboundJob?.cancel()
++        // Both sibling pages stay renderable during an interactive gesture so the
++        // signed position can cross Home without waiting for composition/state swaps.
++        searchLayerActive = true
++        drawerLayerActive = true
++        return interactionGeneration
++    }
++
++    /** Own a local Search pull without activating the other page layers. */
++    fun beginSearchPull(): Long {
++        check(!isDisposed)
++        interactive = true
++        interactionGeneration++
++        reboundJob?.cancel()
++        searchPullJob?.cancel()
++        return interactionGeneration
++    }
++
++    fun snapTo(positionValue: Float, pullOffset: Float) {
++        searchLayerActive = true
++        drawerLayerActive = true
++
++        // Pointer events can arrive faster than two Animatable.snapTo calls can finish.
++        // Cancelling/restarting a coroutine for every move creates a race where rapid
++        // Home -> All Apps drags can temporarily stop applying live positions. Keep one
++        // worker and coalesce intermediate events to the newest requested frame instead.
++        pendingLivePosition = positionValue.coerceIn(-1f, 1f)
++        pendingLivePullOffset = pullOffset
++        liveSnapVersion++
++        if (liveSnapJob?.isActive == true) return
++
++        liveSnapJob = scope.launch {
++            var appliedVersion = Long.MIN_VALUE
++            while (appliedVersion != liveSnapVersion) {
++                val version = liveSnapVersion
++                val nextPosition = pendingLivePosition
++                val nextPullOffset = pendingLivePullOffset
++                position.snapTo(nextPosition)
++                transitionPullOffset.snapTo(nextPullOffset)
++                appliedVersion = version
++            }
++        }
++    }
++
++    fun clearSearchPull() {
++        searchPullJob?.cancel()
++        searchPullJob = scope.launch {
++            searchPullOffset.snapTo(0f)
++        }
++    }
++
++    fun snapSearchPullTo(value: Float) {
++        searchPullJob?.cancel()
++        searchPullJob = scope.launch {
++            searchPullOffset.snapTo(value.coerceAtLeast(0f))
++        }
++    }
++
++    fun settle(
++        page: VerticalPage,
++        startValue: Float? = null,
++        reboundDurationMs: Int,
++        durationOverrideMs: Int? = null,
++    ) {
++        if (isDisposed) return
++        interactive = false
++        interactionGeneration++
++        val effectiveStart = startValue ?: position.value
++        if (
++            page == VerticalPage.Home &&
++            effectiveStart > VerticalPage.Home.anchor &&
++            (stablePage == VerticalPage.Search || returningFromSearch)
++        ) {
++            beginSearchReturn(effectiveStart)
++        }
++
++        targetPage = page
++        settleJob?.cancel()
++        liveSnapJob?.cancel()
++        searchPullJob?.cancel()
++        reboundJob?.cancel()
++
++        when (page) {
++            VerticalPage.Search -> searchLayerActive = true
++            VerticalPage.AllApps -> drawerLayerActive = true
++            VerticalPage.Home -> {
++                // Keep whichever page(s) are currently visible alive until the settle
++                // reaches Home, otherwise a partially visible layer would disappear.
++            }
++        }
++
++        val duration = durationOverrideMs?.coerceIn(80, 600)
++            ?: reboundDurationMs.coerceIn(160, 600)
++        settleJob = scope.launch {
++            startValue?.let {
++                position.snapTo(it.coerceIn(-1f, 1f))
++            }
++
++            kotlinx.coroutines.coroutineScope {
++                launch {
++                    position.animateTo(
++                        targetValue = page.anchor,
++                        animationSpec = tween(
++                            durationMillis = duration,
++                            easing = FastStartSoftFinishEasing,
++                        ),
++                    )
++                }
++                launch {
++                    transitionPullOffset.animateTo(
++                        targetValue = 0f,
++                        animationSpec = tween(
++                            durationMillis = duration,
++                            easing = FastStartSoftFinishEasing,
++                        ),
++                    )
++                }
++            }
++
++            stablePage = page
++            targetPage = page
++            searchLayerActive = page == VerticalPage.Search
++            drawerLayerActive = page == VerticalPage.AllApps
++            returningFromSearch = false
++            searchReturnStartPosition = VerticalPage.Search.anchor
++            if (page != VerticalPage.Search) {
++                searchPullOffset.snapTo(0f)
++            }
++        }
++    }
++
++    fun reboundSearchPull(reboundDurationMs: Int) {
++        if (isDisposed) return
++        interactive = false
++        interactionGeneration++
++        reboundJob?.cancel()
++        searchPullJob?.cancel()
++        reboundJob = scope.launch {
++            searchPullOffset.animateTo(
++                targetValue = 0f,
++                animationSpec = tween(
++                    durationMillis = reboundDurationMs.coerceIn(160, 600),
++                    easing = FastStartSoftFinishEasing,
++                ),
++            )
++        }
++    }
++
++    suspend fun reset() {
++        interactive = false
++        interactionGeneration++
++        settleJob?.cancel()
++        liveSnapJob?.cancel()
++        searchPullJob?.cancel()
++        reboundJob?.cancel()
++        targetPage = VerticalPage.Home
++        stablePage = VerticalPage.Home
++        position.snapTo(VerticalPage.Home.anchor)
++        transitionPullOffset.snapTo(0f)
++        searchPullOffset.snapTo(0f)
++        searchLayerActive = false
++        drawerLayerActive = false
++        returningFromSearch = false
++        searchReturnStartPosition = VerticalPage.Search.anchor
++    }
++
++    /** Do not start recovery animations once the composition has been destroyed. */
++    fun dispose() {
++        isDisposed = true
++        interactive = false
++        interactionGeneration++
++        settleJob?.cancel()
++        liveSnapJob?.cancel()
++        searchPullJob?.cancel()
++        reboundJob?.cancel()
++    }
++}
+--- a/app/src/test/java/com/flower/launcher/home/HomePageEditorTest.kt
++++ b/app/src/test/java/com/flower/launcher/home/HomePageEditorTest.kt
+@@ -0,0 +1,58 @@
++package com.flower.launcher.home
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotEquals
++import org.junit.Test
++
++class HomePageEditorTest {
++    @Test fun visitingPagesDoesNotChangeTheDefault() {
++        val original = HomePreferences(pageCount = 4, defaultHomePage = 1)
++        val visited = visitHomePage(visitHomePage(original, 2), 3)
++        assertEquals(1, visited.defaultHomePage)
++        assertEquals(3, visited.lastHomePage)
++    }
++
++    @Test fun changingDefaultDoesNotOverwriteVisitHistory() {
++        val updated = setDefaultHomePage(HomePreferences(pageCount = 4, lastHomePage = 3), 2)
++        assertEquals(2, updated.defaultHomePage)
++        assertEquals(3, updated.lastHomePage)
++    }
++
++    @Test fun oldInstallKeepsItsExistingPageOnce() {
++        val migrated = restoredDefaultHomePage(null, 2, 4)
++        assertEquals(2, migrated)
++        assertEquals(2, restoredDefaultHomePage(migrated, 3, 4))
++    }
++
++    @Test fun corruptOrOutOfRangePagesAreClamped() {
++        assertEquals(0, restoredDefaultHomePage(null, -10, 4))
++        assertEquals(2, restoredDefaultHomePage(99, 0, 3))
++        assertEquals(0, restoredDefaultHomePage(null, 8, 0))
++        assertEquals(2, setDefaultHomePage(HomePreferences(pageCount = 3), 99).defaultHomePage)
++    }
++
++    @Test fun deletionRemapsDefaultAndRecentPageIndependently() {
++        val updated = removeHomePage(
++            HomePreferences(pageCount = 5, defaultHomePage = 3, lastHomePage = 1), 2,
++        )
++        assertEquals(4, updated.pageCount)
++        assertEquals(2, updated.defaultHomePage)
++        assertEquals(1, updated.lastHomePage)
++    }
++
++    @Test fun deletingTheDefaultUsesThePreviousSurvivingPage() {
++        val updated = removeHomePage(
++            HomePreferences(pageCount = 4, defaultHomePage = 2, lastHomePage = 3), 2,
++        )
++        assertEquals(1, updated.defaultHomePage)
++        assertEquals(2, updated.lastHomePage)
++        assertEquals(0, removeHomePage(HomePreferences(pageCount = 2), 0).defaultHomePage)
++    }
++
++    @Test fun homeCommandCanRepeatEvenWhenItsTargetIsUnchanged() {
++        val first = HomePageRequest(1)
++        val next = first.navigateTo(1)
++        assertNotEquals(first, next)
++        assertEquals(first.page, next.page)
++    }
++}
+--- a/app/src/test/java/com/flower/launcher/settings/DebouncedPreferenceWriterTest.kt
++++ b/app/src/test/java/com/flower/launcher/settings/DebouncedPreferenceWriterTest.kt
+@@ -0,0 +1,89 @@
++package com.flower.launcher.settings
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.test.advanceTimeBy
++import kotlinx.coroutines.test.advanceUntilIdle
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class DebouncedPreferenceWriterTest {
++    @Test fun rapidEditsPersistOnlyTheLatestValueAfterQuietPeriod() = runTest {
++        val writes = mutableListOf<Int>()
++        val writer = DebouncedPreferenceWriter(this, 0) { writes.add(it) }
++        writer.submit(1)
++        advanceTimeBy(100)
++        writer.submit(2)
++        advanceTimeBy(100)
++        writer.submit(3)
++        advanceTimeBy(299)
++        runCurrent()
++        assertEquals(emptyList<Int>(), writes)
++        advanceTimeBy(1)
++        runCurrent()
++        assertEquals(listOf(3), writes)
++    }
++
++    @Test fun leavingEditorFlushesOnceAndCancelsDelayedDuplicate() = runTest {
++        val writes = mutableListOf<String>()
++        val writer = DebouncedPreferenceWriter(this, "old") { writes.add(it) }
++        writer.submit("new")
++        writer.flush()
++        writer.flush()
++        advanceUntilIdle()
++        assertEquals(listOf("new"), writes)
++    }
++
++    @Test fun returningToSavedValueNeedsNoWrite() = runTest {
++        val writes = mutableListOf<Int>()
++        val writer = DebouncedPreferenceWriter(this, 5) { writes.add(it) }
++        writer.submit(6)
++        writer.submit(5)
++        advanceUntilIdle()
++        writer.flush()
++        assertEquals(emptyList<Int>(), writes)
++    }
++
++    @Test fun disposalCanFlushAfterCoroutineScopeIsCancelled() = runTest {
++        val writes = mutableListOf<Int>()
++        val editScope = CoroutineScope(coroutineContext + Job())
++        val writer = DebouncedPreferenceWriter(editScope, 0) { writes.add(it) }
++        writer.submit(7)
++        editScope.cancel()
++        writer.flush()
++        advanceUntilIdle()
++        assertEquals(listOf(7), writes)
++    }
++
++    @Test fun identicalSubmissionsDoNotPostponeSavingForever() = runTest {
++        val writes = mutableListOf<Int>()
++        val writer = DebouncedPreferenceWriter(this, 0) { writes.add(it) }
++        writer.submit(1)
++        advanceTimeBy(200)
++        writer.submit(1)
++        advanceTimeBy(100)
++        runCurrent()
++        assertEquals(listOf(1), writes)
++    }
++
++    @Test fun separatePreferenceGroupsDoNotCancelEachOther() = runTest {
++        val a = mutableListOf<Int>()
++        val b = mutableListOf<Int>()
++        val first = DebouncedPreferenceWriter(this, 0) { a.add(it) }
++        val second = DebouncedPreferenceWriter(this, 0) { b.add(it) }
++        first.submit(1)
++        advanceTimeBy(200)
++        second.submit(2)
++        advanceTimeBy(100)
++        runCurrent()
++        assertEquals(listOf(1), a)
++        assertEquals(emptyList<Int>(), b)
++        advanceUntilIdle()
++        assertEquals(listOf(2), b)
++    }
++}
+--- a/app/src/test/java/com/flower/launcher/ui/GestureCoordinatorTest.kt
++++ b/app/src/test/java/com/flower/launcher/ui/GestureCoordinatorTest.kt
+@@ -0,0 +1,103 @@
++package com.flower.launcher.ui
++
++import androidx.compose.ui.geometry.Offset
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class GestureCoordinatorTest {
++    private fun GestureCoordinator.begin(id: Long = 10) =
++        beginSearchBottomPointer(pointerId = 7, searchSessionId = id, eligible = true)
++
++    private fun GestureCoordinator.frame(y: Float, time: Long, pressed: Boolean = true) =
++        onSearchPointerFrame(
++            pointerId = 7, searchSessionId = 10, position = Offset(0f, y),
++            uptimeMillis = time, pressed = pressed, currentPagePosition = 1f,
++            dragDistancePx = 100f, touchSlopPx = 8f, settleThreshold = 0.4f,
++            openVelocityPx = Float.MAX_VALUE,
++        )
++
++    @Test fun candidateCancellationDoesNotMoveThePage() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 1f, 1))
++        assertFalse(coordinator.commitSearchBottomReturn(10))
++    }
++
++    @Test fun commitAndReleaseInSameFrameSettlesHomeExactlyOnce() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        assertTrue(coordinator.commitSearchBottomReturn(10))
++        assertFalse(coordinator.commitSearchBottomReturn(10))
++        val result = coordinator.frame(100f, 0, pressed = false)
++        assertEquals(SearchReturnSettleTarget.Home, result.finishTarget)
++        assertEquals(1f, result.finishPosition!!, 0.0001f)
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 1f, 1))
++    }
++
++    @Test fun cancellationBeforeFirstPageFrameProvidesAHomeRecovery() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        coordinator.commitSearchBottomReturn(10)
++        val result = coordinator.cancelSearchPointer(7, 10, 0.8f, 1)
++        assertEquals(0.8f, result.beginInteractiveAt!!, 0.0001f)
++        assertEquals(SearchReturnSettleTarget.Home, result.finishTarget)
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 0.8f, 1))
++    }
++
++    @Test fun cancellationUsesLiveDragPositionWithoutRestartingTheGesture() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        coordinator.commitSearchBottomReturn(10)
++        coordinator.frame(100f, 0)
++        coordinator.frame(60f, 200)
++        val result = coordinator.cancelSearchPointer(7, 10, 1f, 1)
++        assertNull(result.beginInteractiveAt)
++        assertEquals(0.6f, result.finishPosition!!, 0.0001f)
++        assertEquals(SearchReturnSettleTarget.Home, result.finishTarget)
++    }
++
++    @Test fun staleCancellationCannotClearANewerSearchSession() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin(11)
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 1f, 1))
++        assertTrue(coordinator.commitSearchBottomReturn(11))
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 1f, 1))
++        assertEquals(SearchReturnSettleTarget.Home, coordinator.cancelSearchPointer(7, 11, 1f, 1).finishTarget)
++    }
++
++    @Test fun resetInvalidatesTheOldRelease() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        coordinator.commitSearchBottomReturn(10)
++        coordinator.reset()
++        assertEquals(SearchReturnGestureFrame.None, coordinator.frame(50f, 200, pressed = false))
++        coordinator.begin(11)
++        assertTrue(coordinator.commitSearchBottomReturn(11))
++    }
++
++    @Test fun reversalCanReturnToSearchWhileContinuingUpReturnsHome() {
++        val coordinator = GestureCoordinator()
++        coordinator.begin()
++        coordinator.commitSearchBottomReturn(10)
++        coordinator.frame(100f, 0)
++        coordinator.frame(60f, 200)
++        val reversed = coordinator.frame(90f, 400, pressed = false)
++        assertEquals(SearchReturnSettleTarget.Search, reversed.finishTarget)
++        coordinator.begin()
++        coordinator.commitSearchBottomReturn(10)
++        coordinator.frame(100f, 1000)
++        assertEquals(SearchReturnSettleTarget.Home, coordinator.frame(60f, 1200, pressed = false).finishTarget)
++    }
++    @Test fun lateCancellationCannotClearANewerPointerInTheSameSearchSession() {
++        val coordinator = GestureCoordinator()
++        val old = coordinator.begin()!!
++        val current = coordinator.begin()!!
++        assertEquals(SearchReturnGestureFrame.None, coordinator.cancelSearchPointer(7, 10, 1f, old))
++        assertTrue(coordinator.commitSearchBottomReturn(10))
++        assertEquals(SearchReturnSettleTarget.Home, coordinator.cancelSearchPointer(7, 10, 1f, current).finishTarget)
++    }
++
++}
+--- a/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt
++++ b/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt
+@@ -0,0 +1,44 @@
++package com.flower.launcher.ui
++
++import kotlinx.coroutines.test.runTest
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VerticalPageTransitionControllerTest {
++    @Test fun aNewGestureInvalidatesCleanupFromThePreviousGesture() = runTest {
++        val controller = VerticalPageTransitionController(this)
++        val old = controller.beginInteractive()
++        val current = controller.beginInteractive()
++        assertFalse(controller.ownsInteraction(old))
++        assertTrue(controller.ownsInteraction(current))
++        controller.dispose()
++    }
++
++    @Test fun homeResetInvalidatesPendingGestureRecovery() = runTest {
++        val controller = VerticalPageTransitionController(this)
++        val owner = controller.beginInteractive()
++        controller.reset()
++        assertFalse(controller.ownsInteraction(owner))
++    }
++
++    @Test fun leavingCompositionInvalidatesBothPageAndLocalPullOwnership() = runTest {
++        val controller = VerticalPageTransitionController(this)
++        val page = controller.beginInteractive()
++        val pull = controller.beginSearchPull()
++        assertFalse(controller.ownsInteraction(page))
++        assertTrue(controller.ownsInteraction(pull))
++        controller.dispose()
++        assertFalse(controller.ownsInteraction(pull))
++        assertTrue(controller.isDisposed)
++    }
++
++    @Test fun anExplicitNavigationInvalidatesOldGestureCleanupImmediately() = runTest {
++        val controller = VerticalPageTransitionController(this)
++        val owner = controller.beginInteractive()
++        controller.settle(VerticalPage.Home, reboundDurationMs = 200)
++        assertFalse(controller.ownsInteraction(owner))
++        // Cancel before the test scheduler starts the animation (no UI frame clock).
++        controller.dispose()
++    }
++}
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -18,6 +18,7 @@
+ androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+ androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
++kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+ junit = { group = "junit", name = "junit", version.ref = "junit" }
+ 
+ [plugins]

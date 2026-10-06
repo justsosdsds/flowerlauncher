@@ -1,0 +1,21 @@
+PASS serialized IME command model exists
+PASS coordinator owns IME reconciliation
+PASS show advances Hidden to Showing before command
+PASS hide advances Visible to Hiding before command
+PASS Showing cannot emit Hide
+PASS presentation readiness only gates Show
+PASS page return suppression remains explicit hide policy
+PASS hidden Search session remains an explicit hide policy
+PASS late visible acknowledgement preserves newer target
+PASS expanded intent no longer pre-sets Hiding
+PASS top pull no longer pre-sets Showing
+PASS legacy programmatic-hide boolean removed
+PASS legacy requestKeyboard toggle removed
+PASS SearchContent executes commands from reconciler
+PASS launcher passes readiness independently from Input target
+PASS settings use independent force-hide policy
+PASS entry reversal serialization regression test exists
+PASS readiness drop no-hide regression test exists
+PASS late visible regression test exists
+PASS external reveal from stable Expanded regression test exists
+PASS abrupt session end final-hide regression test exists

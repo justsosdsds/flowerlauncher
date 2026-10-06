@@ -1,0 +1,11 @@
+PASS Search foreground uses ADJUST_NOTHING
+PASS Non-Search restores ADJUST_RESIZE
+PASS Results viewport is measured
+PASS Real Search content is measured
+PASS Collapse uses geometric overflow
+PASS Old maxValue collapse check removed
+PASS Floating field owns imePadding
+PASS Root Search box no longer chains nav+ime padding
+PASS No dynamic IME spacer
+PASS Interruptible rebound preserved
+PASS IME reveal still immediate

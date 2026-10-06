@@ -1,0 +1,13 @@
+V60 targeted static checks: PASS
+
+Verified:
+- Search threshold callback no longer calls closeSearch()/settle while pointer is down.
+- Same-pointer threshold arm immediately starts interactive page ownership.
+- Existing compact Search-return visual state is started at handoff boundary.
+- Page settle occurs only after pointer release in the handoff modifier.
+- SearchInteractionState.beginInteractive() is non-suspend and uses cancel().
+- SearchCoordinator.beginInteractive() is non-suspend.
+- cancelAndJoin import/call is absent.
+- Search return visual constants remain unchanged.
+
+Gradle compile was attempted but the wrapper cannot resolve mirrors.aliyun.com in this environment.

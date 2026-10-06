@@ -1,0 +1,12 @@
+PASS threshold still immediate
+PASS threshold still haptic
+PASS threshold does not rebound
+PASS post-threshold drag not forcibly swallowed
+PASS release starts rebound
+PASS pointer-down interrupts rebound
+PASS rebound has owned job
+PASS beginInteractive joins cancellation
+PASS animation write generation guard
+PASS drag cancels old rebound
+PASS LauncherRoot preserved
+PASS compact return constants preserved

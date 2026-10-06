@@ -1,0 +1,6 @@
+PASS: 26 transition/blur constants unchanged
+PASS: 9 visual/gesture functions and easing curve unchanged
+PASS: 14 resource/build/settings files byte-identical
+PASS: literal dp/sp dimensions unchanged in four edited UI files
+PASS: 202202 drawer alpha interpolation checks (real-number model, not GPU pixel comparison)
+LIMIT: this does not compile Kotlin or validate lifecycle, device rendering, power, or frame times.

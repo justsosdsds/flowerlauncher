@@ -1,0 +1,880 @@
+diff --git a/shepherd_work/README_V70_START_HERE.md b/README_V70_START_HERE.md
+new file mode 100644
+index 0000000..2b9ceb3
+--- /dev/null
++++ b/README_V70_START_HERE.md
+@@ -0,0 +1,52 @@
++# V70：统一搜索顶部下拉与 IME Reveal
++
++基线为上一版交付的 V69。本版针对一个可稳定复现的问题：搜索框为空、IME 已手动收起时，下拉超过“重新显示输入法”阈值不会重新弹出 IME。
++
++## 根因
++
++V69 之前存在两套顶部下拉路径：
++
++- 空查询：`LauncherRoot` 处理整页 Search rubber-band。
++- 非空查询：`SearchContent` + `SearchCoordinator` 处理结果区 rubber-band、IME Reveal 和结果滚动。
++
++因此 IME Reveal 阈值只存在于非空查询路径，空查询无法触发。
++
++## V70 行为
++
++- 空查询与非空查询的**顶部下拉**统一进入 `SearchContent` 的 NestedScroll。
++- 两种查询状态共用同一个 `SearchInteractionState`、rubber-band 公式、回弹时长和 `imeRevealPullThresholdDp`。
++- 空查询下拉时只移动结果区域，底部浮动搜索栏保持固定。
++- IME Hidden 且顶部视觉位移达到用户设置阈值时，空/非空查询都会立即触发相同的振动、`requestFocus()` 与 `keyboardController.show()`。
++- 空查询的**上滑 Search -> Home** 仍由 `LauncherRoot` 原页面手势负责，不改变原有页面返回阈值、速度判定、IME hide threshold 和页面 settle 行为。
++- 非空查询的结果滚动、底部 rubber-band、达到阈值返回 Home 仍走现有 V54/V59-V61 handoff 路径。
++
++## 架构变化
++
++`SearchCoordinator` 将边界手势明确拆成：
++
++- `onTopBoundaryDrag(...)`：query-agnostic，统一顶部 rubber-band 与 IME Reveal。
++- `onBottomBoundaryDrag(...)`：只服务非空查询的底部 Return Home。
++
++`LauncherRoot` 不再持有空查询专用的整页 `searchPullOffset`。对应的 `VerticalPageTransitionController` 本地 Search pull 状态、动画 Job 和相关 API 已删除。
++
++同时保留一个关键边界：当空查询的新上滑页面手势真正取得 ownership 时，会清理上一触摸残留的 Search-local overscroll，避免中断回弹后结果区位移残留到页面过渡中。
++
++## 验证
++
++新增：
++
++- `app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt`
++- `verification/verify_v70_unified_search_pull.py`
++
++源码级检查覆盖：
++
++- 空/非空查询共用顶部 IME Reveal。
++- 空查询不会误进入非空查询 bottom Return Home 路径。
++- 空查询支持反向消除现有顶部 rubber-band。
++- query 从非空切到空时不再强制重置共享顶部 pull 状态。
++- LauncherRoot 不再移动整个 Search 平面。
++- V61 GestureCoordinator handoff 关键约束仍全部通过。
++
++当前执行环境无法下载工程指定的 Gradle 8.13（`mirrors.aliyun.com` 无网络访问），因此未完成 `assembleDebug` / JVM 单元测试的真实 Gradle 执行。使用本地 Kotlin 编译器做了源码语法扫描，没有发现语法错误或本次新增方法的未解析引用。
++
++最终验收建议重点覆盖：空查询/非空查询 × IME Visible/Hidden、下拉阈值前后、下拉后反向、回弹中再次触摸、空查询直接上滑返回 Home、非空查询滚到底继续上拉返回 Home。
+diff --git a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+index 4a9a7c3..4a99a1b 100644
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+@@ -335,7 +335,6 @@ fun LauncherRoot(
+     val verticalTransition = remember(scope) { VerticalPageTransitionController(scope) }
+     val verticalPosition = verticalTransition.position
+     val transitionPullOffset = verticalTransition.transitionPullOffset
+-    val searchPullOffset = verticalTransition.searchPullOffset
+     val searchLayerActive = verticalTransition.searchLayerActive
+     val drawerLayerActive = verticalTransition.drawerLayerActive
+     val searchCoordinator = rememberSearchCoordinator()
+@@ -394,7 +393,6 @@ fun LauncherRoot(
+     val searchReturnImeHideThresholdPx = with(density) {
+         launcherPreferences.searchReturnImeHideThresholdDp.coerceIn(0, 40).dp.toPx()
+     }
+-    val searchPullLimitPx = with(density) { (configuration.screenHeightDp.dp * SEARCH_PULL_LIMIT_RATIO).toPx() }
+     val homePullLimitPx = with(density) { (configuration.screenHeightDp.dp * HOME_PULL_LIMIT_RATIO).toPx() }
+ 
+     fun settleTo(
+@@ -445,10 +443,6 @@ fun LauncherRoot(
+         settleTo(VerticalPage.AllApps)
+     }
+ 
+-    fun reboundSearchPull() {
+-        verticalTransition.reboundSearchPull(launcherPreferences.searchReboundDurationMs)
+-    }
+-
+     fun resetDrawerImmediately() {
+         drawerFlingJob?.cancel()
+         scope.launch { verticalTransition.reset() }
+@@ -1003,7 +997,7 @@ fun LauncherRoot(
+             // but it must not sit above All Apps unless Search is actually on the active
+             // side of the signed transition. This prevents an invisible Search layer from
+             // consuming drawer gestures during Home -> All Apps.
+-            val searchPullGestureModifier = if (
++            val emptySearchPageGestureModifier = if (
+                 searchOwnsForeground &&
+                 !searchCoordinator.state.hasQuery &&
+                 !showSearchSettings &&
+@@ -1011,7 +1005,6 @@ fun LauncherRoot(
+                 launcherPreferences.enableSwipeGestures
+             ) {
+                 Modifier.pointerInput(
+-                    searchPullLimitPx,
+                     homePullLimitPx,
+                     dragDistancePx,
+                     settleThreshold,
+@@ -1023,14 +1016,9 @@ fun LauncherRoot(
+                         val down = awaitFirstDown(requireUnconsumed = false)
+                         var lastY = down.position.y
+                         var accumulatedY = 0f
+-                        var rawPullDistance = if (searchPullOffset.value > 0f) {
+-                            inverseRubberBandDistance(searchPullOffset.value, searchPullLimitPx)
+-                        } else {
+-                            0f
+-                        }
+                         var direction = 0 // 1 = down, -1 = up
+-                        // 1 = stable empty-Search rubber-band
+-                        // 2 = shared empty Search <-> Home transition
++                        // Stable empty-Search downward pulls now belong to SearchContent.
++                        // Mode 2 preserves the existing page-level Search <-> Home path.
+                         var mode = 0
+                         var gestureStartPosition = verticalPosition.value.coerceIn(-1f, 1f)
+                         var latestPosition = gestureStartPosition
+@@ -1074,101 +1062,89 @@ fun LauncherRoot(
+                                                 gestureStartPosition >= SEARCH_STABLE_PROGRESS &&
+                                                 kotlin.math.abs(gestureStartTransitionOffset) < 1f
+ 
++                                        // Do not consume a stable Search downward pull here.
++                                        // SearchContent's NestedScroll owns the result-only
++                                        // rubber-band and the unified IME reveal threshold.
+                                         mode = if (stableSearch && direction == 1) {
+-                                            interactionOwner = verticalTransition.beginSearchPull()
+-                                            1
++                                            0
+                                         } else {
+                                             if (direction < 0 && gestureStartPosition > VerticalPage.Home.anchor) {
+                                                 verticalTransition.beginSearchReturn(gestureStartPosition)
+                                             }
++                                            // A new page-level gesture supersedes any
++                                            // Search-local rebound left from the previous touch.
++                                            searchCoordinator.clearBoundaryOverscroll()
+                                             interactionOwner = verticalTransition.beginInteractive()
+-                                            verticalTransition.clearSearchPull()
+                                             2
+                                         }
+                                     }
+                                 }
+ 
+-                                when (mode) {
+-                                    1 -> {
+-                                        change.consume()
+-                                        rawPullDistance = (rawPullDistance + dy).coerceAtLeast(0f)
+-                                        verticalTransition.snapSearchPullTo(
+-                                            rubberBandDistance(rawPullDistance, searchPullLimitPx),
+-                                        )
++                                if (mode == 2) {
++                                    change.consume()
++                                    if (dy < 0f && latestPosition > VerticalPage.Home.anchor) {
++                                        verticalTransition.beginSearchReturn(latestPosition)
+                                     }
+-
+-                                    2 -> {
+-                                        change.consume()
+-                                        if (dy < 0f && latestPosition > VerticalPage.Home.anchor) {
+-                                            verticalTransition.beginSearchReturn(latestPosition)
+-                                        }
+-                                        latestPosition = (
+-                                            gestureStartPosition + accumulatedY / dragDistancePx
+-                                        ).coerceIn(-1f, 1f)
+-                                        if (
+-                                            dy < 0f &&
+-                                            verticalTransition.returningFromSearch &&
+-                                            !searchCoordinator.state.pageReturnImeSuppressed
+-                                        ) {
+-                                            val returnedDistancePx = (
+-                                                (verticalTransition.searchReturnStartPosition - latestPosition) *
+-                                                    dragDistancePx
+-                                            ).coerceAtLeast(0f)
+-                                            if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
+-                                                searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+-                                            }
++                                    latestPosition = (
++                                        gestureStartPosition + accumulatedY / dragDistancePx
++                                    ).coerceIn(-1f, 1f)
++                                    if (
++                                        dy < 0f &&
++                                        verticalTransition.returningFromSearch &&
++                                        !searchCoordinator.state.pageReturnImeSuppressed
++                                    ) {
++                                        val returnedDistancePx = (
++                                            (verticalTransition.searchReturnStartPosition - latestPosition) *
++                                                dragDistancePx
++                                        ).coerceAtLeast(0f)
++                                        if (returnedDistancePx + 0.5f >= searchReturnImeHideThresholdPx) {
++                                            searchCoordinator.dispatch(SearchIntent.SuppressImeForPageReturn)
+                                         }
+-                                        val liveOffset = (
+-                                            gestureStartTransitionOffset +
+-                                                signedRubberBandDistance(accumulatedY, homePullLimitPx)
+-                                        ).coerceIn(-homePullLimitPx, homePullLimitPx)
+-                                        verticalTransition.snapTo(
+-                                            positionValue = latestPosition,
+-                                            pullOffset = liveOffset,
+-                                        )
+                                     }
++                                    val liveOffset = (
++                                        gestureStartTransitionOffset +
++                                            signedRubberBandDistance(accumulatedY, homePullLimitPx)
++                                    ).coerceIn(-homePullLimitPx, homePullLimitPx)
++                                    verticalTransition.snapTo(
++                                        positionValue = latestPosition,
++                                        pullOffset = liveOffset,
++                                    )
+                                 }
+                             }
+ 
+-                            when (mode) {
+-                                1 -> {
+-                                    reboundSearchPull()
++                            if (mode == 2) {
++                                val velocityY = runCatching {
++                                    velocityTracker.calculateVelocity().y
++                                }.getOrDefault(0f)
++                                val page = verticalTargetForRelease(
++                                    position = latestPosition,
++                                    velocityY = velocityY,
++                                    velocityThreshold = openVelocityPx,
++                                    settleThreshold = settleThreshold,
++                                )
++                                if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
++                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                 }
+-
+-                                2 -> {
+-                                    val velocityY = runCatching {
+-                                        velocityTracker.calculateVelocity().y
+-                                    }.getOrDefault(0f)
+-                                    val page = verticalTargetForRelease(
+-                                        position = latestPosition,
+-                                        velocityY = velocityY,
+-                                        velocityThreshold = openVelocityPx,
+-                                        settleThreshold = settleThreshold,
+-                                    )
+-                                    if (launcherPreferences.vibrationOnGesture && page != gestureStartPage) {
+-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+-                                    }
+-                                    if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                                    settleTo(page, startValue = latestPosition)
++                                if (page == VerticalPage.Search) {
++                                    searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+                                 }
++                                settleTo(page, startValue = latestPosition)
+                             }
+                             finished = true
+                         } finally {
+                             if (!finished && scope.isActive && !verticalTransition.isDisposed) {
+                                 val owned = interactionOwner
+                                 if (owned != null && verticalTransition.ownsInteraction(owned)) {
+-                                    if (mode == 1) {
+-                                        reboundSearchPull()
+-                                    } else {
+-                                        val page = verticalTargetForRelease(
+-                                            position = latestPosition,
+-                                            velocityY = 0f,
+-                                            velocityThreshold = openVelocityPx,
+-                                            settleThreshold = settleThreshold,
+-                                        )
+-                                        if (page == VerticalPage.Search) searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+-                                        settleTo(page, startValue = latestPosition)
++                                    val page = verticalTargetForRelease(
++                                        position = latestPosition,
++                                        velocityY = 0f,
++                                        velocityThreshold = openVelocityPx,
++                                        settleThreshold = settleThreshold,
++                                    )
++                                    if (page == VerticalPage.Search) {
++                                        searchCoordinator.dispatch(SearchIntent.AllowImeAfterPageReturn)
+                                     }
++                                    settleTo(page, startValue = latestPosition)
+                                 }
+                             }
+                         }
+@@ -1178,8 +1154,8 @@ fun LauncherRoot(
+                 Modifier
+             }
+ 
+-            // Search backdrop remains fixed to the physical screen. Only the Search
+-            // foreground participates in the second-stage rubber-band pull.
++            // Search backdrop remains fixed to the physical screen. Search-local
++            // result rubber-band motion is owned inside SearchContent.
+             if (false && searchLayerActive) {
+                 Box(
+                     modifier = Modifier
+@@ -1210,7 +1186,7 @@ fun LauncherRoot(
+                 modifier = Modifier
+                     .fillMaxSize()
+                     .zIndex(if (searchOwnsForeground) 2f else -0.5f)
+-                    .then(searchPullGestureModifier)
++                    .then(emptySearchPageGestureModifier)
+                     .graphicsLayer {
+                         val p = verticalPosition.value.coerceIn(0f, 1f)
+                         if (verticalTransition.returningFromSearch) {
+@@ -1219,14 +1195,14 @@ fun LauncherRoot(
+                             // local shrink and staged fade so the full page never flies
+                             // off the top edge.
+                             alpha = 1f
+-                            translationY = searchPullOffset.value
++                            translationY = 0f
+                             scaleX = 1f
+                             scaleY = 1f
+                             transformOrigin = TransformOrigin.Center
+                         } else {
+                             val eased = easeOutCubic(p)
+                             alpha = eased
+-                            translationY = transitionPullOffset.value + searchPullOffset.value
++                            translationY = transitionPullOffset.value
+                             val scale = SEARCH_SCALE_MIN + (1f - SEARCH_SCALE_MIN) * eased
+                             scaleX = scale
+                             scaleY = scale
+@@ -1559,12 +1535,6 @@ private fun rubberBandDistance(rawDistance: Float, limit: Float): Float {
+     return (limit * rawDistance) / (limit + rawDistance)
+ }
+ 
+-private fun inverseRubberBandDistance(visibleDistance: Float, limit: Float): Float {
+-    if (visibleDistance <= 0f || limit <= 0f) return 0f
+-    val clamped = visibleDistance.coerceAtMost(limit * 0.999f)
+-    return (clamped * limit) / (limit - clamped)
+-}
+-
+ private fun verticalTargetForRelease(
+     position: Float,
+     velocityY: Float,
+@@ -1623,7 +1593,6 @@ private const val DRAWER_SCRIM_BOTTOM_ALPHA = 0.34f
+ // Above Search (2f), the search scrim (1f) and the drawer layers (1.25/1.5), so the
+ // settings overlays always cover the page they were opened from.
+ private const val SETTINGS_OVERLAY_Z = 3f
+-private const val SEARCH_PULL_LIMIT_RATIO = 0.46f
+ private const val SEARCH_STABLE_PROGRESS = 0.995f
+ private const val SEARCH_RETURN_SETTLE_MS = 110
+ private const val BLUR_LEVELS = HOME_BACKDROP_BLUR_LEVELS
+diff --git a/app/src/main/java/com/flower/launcher/ui/SearchContent.kt b/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
+index 9b887df..af6a911 100644
+--- a/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
+@@ -263,10 +263,10 @@ fun SearchContent(
+         }
+     }
+ 
+-    val queryLocked = searchState.hasQuery
++    val hasQuery = searchState.hasQuery
+     val searchNestedScrollConnection = remember(
+         coordinator,
+-        queryLocked,
++        hasQuery,
+         imeVisible,
+         collapseOverflowThresholdPx,
+         resultsOverflowAboveImePx,
+@@ -282,7 +282,7 @@ fun SearchContent(
+     ) {
+         object : NestedScrollConnection {
+             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+-                if (!queryLocked || source != NestedScrollSource.UserInput) return Offset.Zero
++                if (source != NestedScrollSource.UserInput) return Offset.Zero
+ 
+                 val (consumedY, effect) = coordinator.onPreScroll(
+                     deltaY = available.y,
+@@ -308,19 +308,29 @@ fun SearchContent(
+                 available: Offset,
+                 source: NestedScrollSource,
+             ): Offset {
+-                if (!queryLocked || source != NestedScrollSource.UserInput || available.y == 0f) {
++                if (source != NestedScrollSource.UserInput || available.y == 0f) {
+                     return Offset.Zero
+                 }
+ 
+-                when (
+-                    coordinator.onBoundaryDrag(
++                // Downward top-boundary pull is one Search-local interaction for both
++                // empty and non-empty queries. Upward empty-Search motion stays
++                // unconsumed here so LauncherRoot can preserve the existing page return.
++                val effect = when {
++                    available.y > 0f -> coordinator.onTopBoundaryDrag(
+                         deltaY = available.y,
+                         imeVisible = imeVisible,
+                         overscrollLimitPx = overscrollLimitPx,
+                         revealPullThresholdPx = revealPullThresholdPx,
++                    )
++                    hasQuery -> coordinator.onBottomBoundaryDrag(
++                        deltaY = available.y,
++                        overscrollLimitPx = overscrollLimitPx,
+                         homeReturnPullThresholdPx = homeReturnPullThresholdPx,
+                     )
+-                ) {
++                    else -> SearchBoundaryEffect.None
++                }
++
++                when (effect) {
+                     SearchBoundaryEffect.ReturnHome -> {
+                         if (onReturnHomeThreshold()) {
+                             if (preferences.homeReturnHapticEnabled) {
+@@ -350,11 +360,14 @@ fun SearchContent(
+                     -> Unit
+                 }
+ 
+-                return Offset(0f, available.y)
++                return when {
++                    available.y > 0f -> Offset(0f, available.y)
++                    hasQuery -> Offset(0f, available.y)
++                    else -> Offset.Zero
++                }
+             }
+ 
+             override suspend fun onPreFling(available: Velocity): Velocity {
+-                if (!queryLocked) return Velocity.Zero
+                 if (coordinator.state.phase == SearchPhase.Returning) return available
+                 if (interactionState.rawOverscrollPx == 0f) return Velocity.Zero
+                 coordinator.onRelease(interactionScope, reboundDurationMs)
+@@ -375,11 +388,11 @@ fun SearchContent(
+             // Observe pointer-down without consuming it. If a release-time rebound is
+             // still running, stop it at its live position before nested scrolling or
+             // child gestures begin handling this touch.
+-            .pointerInput(queryLocked, interactionState) {
++            .pointerInput(interactionState) {
+                 awaitEachGesture {
+                     awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                     val sessionId = coordinator.state.sessionId
+-                    if (queryLocked) coordinator.beginInteractive()
++                    coordinator.beginInteractive()
+                     try {
+                         do {
+                             val event = awaitPointerEvent(PointerEventPass.Final)
+@@ -387,7 +400,7 @@ fun SearchContent(
+                     } finally {
+                         // An interrupted touch can cancel an existing rebound without
+                         // producing a fling. Resume it only for the same live session.
+-                        if (queryLocked && interactionScope.isActive &&
++                        if (interactionScope.isActive &&
+                             coordinator.state.sessionId == sessionId &&
+                             coordinator.state.phase == SearchPhase.Active
+                         ) {
+diff --git a/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt b/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt
+index d641dee..2d0db1a 100644
+--- a/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchCoordinator.kt
+@@ -85,11 +85,7 @@ class SearchCoordinator internal constructor(
+     fun dispatch(intent: SearchIntent) {
+         when (intent) {
+             is SearchIntent.QueryChanged -> {
+-                val query = intent.query
+-                state = state.copy(query = query)
+-                if (query.trim().isEmpty()) {
+-                    interaction.resetOverscroll()
+-                }
++                state = state.copy(query = intent.query)
+             }
+ 
+             is SearchIntent.SessionActiveChanged -> {
+@@ -151,19 +147,19 @@ class SearchCoordinator internal constructor(
+         }
+     }
+ 
+-    /** Called for user-input pre-scroll while Search owns a non-empty query. */
++    /** Called for user-input pre-scroll while Search is active. */
+     fun onPreScroll(
+         deltaY: Float,
+         imeVisible: Boolean,
+         contentOverflowAboveImePx: Float,
+         collapseOverflowThresholdPx: Float,
+     ): Pair<Float, SearchPreScrollEffect> {
+-        if (!state.hasQuery) return 0f to SearchPreScrollEffect.None
+         if (state.phase == SearchPhase.Returning) return deltaY to SearchPreScrollEffect.ConsumeAll
+         if (state.phase != SearchPhase.Active) return 0f to SearchPreScrollEffect.None
+ 
+         var effect = SearchPreScrollEffect.None
+         if (
++            state.hasQuery &&
+             deltaY < 0f &&
+             imeVisible &&
+             state.imePhase != SearchImePhase.Hiding &&
+@@ -178,27 +174,22 @@ class SearchCoordinator internal constructor(
+     }
+ 
+     /**
+-     * Called only with unconsumed drag after the result scroller reaches a boundary.
+-     * Returning/Reveal effects are single-fire because they advance semantic state.
++     * Handle a downward pull after the result scroller reaches its top boundary.
++     * This is intentionally query-agnostic: empty and non-empty Search share the
++     * same rubber-band physics and IME reveal threshold.
+      */
+-    fun onBoundaryDrag(
++    fun onTopBoundaryDrag(
+         deltaY: Float,
+         imeVisible: Boolean,
+         overscrollLimitPx: Float,
+         revealPullThresholdPx: Float,
+-        homeReturnPullThresholdPx: Float,
+     ): SearchBoundaryEffect {
+-        if (!state.hasQuery) return SearchBoundaryEffect.None
+         if (state.phase == SearchPhase.Returning) return SearchBoundaryEffect.ConsumeAll
+-        if (state.phase != SearchPhase.Active) return SearchBoundaryEffect.None
++        if (state.phase != SearchPhase.Active || deltaY <= 0f) return SearchBoundaryEffect.None
+ 
+         interaction.addBoundaryDrag(deltaY)
+         val visual = interaction.visualOverscrollPx(overscrollLimitPx)
+ 
+-        if (visual < 0f && -visual >= homeReturnPullThresholdPx) {
+-            return SearchBoundaryEffect.ReturnHome
+-        }
+-
+         if (
+             visual > 0f &&
+             !imeVisible &&
+@@ -212,13 +203,40 @@ class SearchCoordinator internal constructor(
+         return SearchBoundaryEffect.None
+     }
+ 
++    /**
++     * Handle upward overscroll after non-empty results reach their bottom boundary.
++     * Empty Search keeps its existing page-level Search -> Home gesture in LauncherRoot.
++     */
++    fun onBottomBoundaryDrag(
++        deltaY: Float,
++        overscrollLimitPx: Float,
++        homeReturnPullThresholdPx: Float,
++    ): SearchBoundaryEffect {
++        if (!state.hasQuery) return SearchBoundaryEffect.None
++        if (state.phase == SearchPhase.Returning) return SearchBoundaryEffect.ConsumeAll
++        if (state.phase != SearchPhase.Active || deltaY >= 0f) return SearchBoundaryEffect.None
++
++        interaction.addBoundaryDrag(deltaY)
++        val visual = interaction.visualOverscrollPx(overscrollLimitPx)
++
++        if (visual < 0f && -visual >= homeReturnPullThresholdPx) {
++            return SearchBoundaryEffect.ReturnHome
++        }
++
++        return SearchBoundaryEffect.None
++    }
++
+     fun beginInteractive() {
+         interaction.beginInteractive()
+     }
+ 
++    fun clearBoundaryOverscroll() {
++        interaction.resetOverscroll()
++    }
++
+     fun onRelease(scope: CoroutineScope, reboundDurationMs: Int) {
+         if (state.phase == SearchPhase.Returning) return
+-        if (state.hasQuery && interaction.rawOverscrollPx != 0f) {
++        if (interaction.rawOverscrollPx != 0f) {
+             interaction.startRebound(scope, reboundDurationMs)
+         }
+     }
+diff --git a/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt b/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt
+index 3421566..2f9776f 100644
+--- a/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt
++++ b/app/src/main/java/com/flower/launcher/ui/VerticalPageTransitionController.kt
+@@ -30,7 +30,6 @@ internal class VerticalPageTransitionController(
+ ) {
+     val position = Animatable(VerticalPage.Home.anchor)
+     val transitionPullOffset = Animatable(0f)
+-    val searchPullOffset = Animatable(0f)
+ 
+     var targetPage by mutableStateOf(VerticalPage.Home)
+         private set
+@@ -58,8 +57,6 @@ internal class VerticalPageTransitionController(
+     private var pendingLivePosition = VerticalPage.Home.anchor
+     private var pendingLivePullOffset = 0f
+     private var liveSnapVersion = 0L
+-    private var searchPullJob: Job? = null
+-    private var reboundJob: Job? = null
+     private var interactionGeneration = 0L
+     private var interactive = false
+     var isDisposed = false
+@@ -88,8 +85,6 @@ internal class VerticalPageTransitionController(
+         interactionGeneration++
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+         // Both sibling pages stay renderable during an interactive gesture so the
+         // signed position can cross Home without waiting for composition/state swaps.
+         searchLayerActive = true
+@@ -97,16 +92,6 @@ internal class VerticalPageTransitionController(
+         return interactionGeneration
+     }
+ 
+-    /** Own a local Search pull without activating the other page layers. */
+-    fun beginSearchPull(): Long {
+-        check(!isDisposed)
+-        interactive = true
+-        interactionGeneration++
+-        reboundJob?.cancel()
+-        searchPullJob?.cancel()
+-        return interactionGeneration
+-    }
+-
+     fun snapTo(positionValue: Float, pullOffset: Float) {
+         searchLayerActive = true
+         drawerLayerActive = true
+@@ -133,20 +118,6 @@ internal class VerticalPageTransitionController(
+         }
+     }
+ 
+-    fun clearSearchPull() {
+-        searchPullJob?.cancel()
+-        searchPullJob = scope.launch {
+-            searchPullOffset.snapTo(0f)
+-        }
+-    }
+-
+-    fun snapSearchPullTo(value: Float) {
+-        searchPullJob?.cancel()
+-        searchPullJob = scope.launch {
+-            searchPullOffset.snapTo(value.coerceAtLeast(0f))
+-        }
+-    }
+-
+     fun settle(
+         page: VerticalPage,
+         startValue: Float? = null,
+@@ -168,8 +139,6 @@ internal class VerticalPageTransitionController(
+         targetPage = page
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+ 
+         when (page) {
+             VerticalPage.Search -> searchLayerActive = true
+@@ -214,26 +183,6 @@ internal class VerticalPageTransitionController(
+             drawerLayerActive = page == VerticalPage.AllApps
+             returningFromSearch = false
+             searchReturnStartPosition = VerticalPage.Search.anchor
+-            if (page != VerticalPage.Search) {
+-                searchPullOffset.snapTo(0f)
+-            }
+-        }
+-    }
+-
+-    fun reboundSearchPull(reboundDurationMs: Int) {
+-        if (isDisposed) return
+-        interactive = false
+-        interactionGeneration++
+-        reboundJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob = scope.launch {
+-            searchPullOffset.animateTo(
+-                targetValue = 0f,
+-                animationSpec = tween(
+-                    durationMillis = reboundDurationMs.coerceIn(160, 600),
+-                    easing = FastStartSoftFinishEasing,
+-                ),
+-            )
+         }
+     }
+ 
+@@ -242,13 +191,10 @@ internal class VerticalPageTransitionController(
+         interactionGeneration++
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+         targetPage = VerticalPage.Home
+         stablePage = VerticalPage.Home
+         position.snapTo(VerticalPage.Home.anchor)
+         transitionPullOffset.snapTo(0f)
+-        searchPullOffset.snapTo(0f)
+         searchLayerActive = false
+         drawerLayerActive = false
+         returningFromSearch = false
+@@ -262,7 +208,5 @@ internal class VerticalPageTransitionController(
+         interactionGeneration++
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
+-        searchPullJob?.cancel()
+-        reboundJob?.cancel()
+     }
+ }
+diff --git a/shepherd_work/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt b/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt
+new file mode 100644
+index 0000000..43bcc9f
+--- /dev/null
++++ b/app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt
+@@ -0,0 +1,94 @@
++package com.flower.launcher.ui
++
++import androidx.compose.foundation.ScrollState
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class SearchCoordinatorTest {
++    private fun activeCoordinator(query: String = ""): SearchCoordinator {
++        val coordinator = SearchCoordinator(SearchInteractionState(ScrollState(0)))
++        coordinator.dispatch(SearchIntent.SessionActiveChanged(true))
++        coordinator.dispatch(SearchIntent.QueryChanged(query))
++        coordinator.dispatch(SearchIntent.ImeVisibilityChanged(false))
++        return coordinator
++    }
++
++    @Test fun emptyQueryTopPullUsesTheSameImeRevealThreshold() {
++        val coordinator = activeCoordinator()
++
++        val effect = coordinator.onTopBoundaryDrag(
++            deltaY = 100f,
++            imeVisible = false,
++            overscrollLimitPx = 1000f,
++            revealPullThresholdPx = 50f,
++        )
++
++        assertEquals(SearchBoundaryEffect.RevealIme, effect)
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++        assertTrue(coordinator.interaction.rawOverscrollPx > 0f)
++    }
++
++    @Test fun nonEmptyQueryTopPullUsesTheSameImeRevealThreshold() {
++        val coordinator = activeCoordinator("flower")
++
++        val effect = coordinator.onTopBoundaryDrag(
++            deltaY = 100f,
++            imeVisible = false,
++            overscrollLimitPx = 1000f,
++            revealPullThresholdPx = 50f,
++        )
++
++        assertEquals(SearchBoundaryEffect.RevealIme, effect)
++        assertEquals(SearchImePhase.Showing, coordinator.state.imePhase)
++    }
++
++    @Test fun emptyQueryDoesNotAcquireTheNonEmptyBottomReturnPath() {
++        val coordinator = activeCoordinator()
++
++        val effect = coordinator.onBottomBoundaryDrag(
++            deltaY = -120f,
++            overscrollLimitPx = 1000f,
++            homeReturnPullThresholdPx = 50f,
++        )
++
++        assertEquals(SearchBoundaryEffect.None, effect)
++        assertEquals(0f, coordinator.interaction.rawOverscrollPx, 0.0001f)
++    }
++
++    @Test fun emptyQueryCanReverseAnExistingTopRubberBand() {
++        val coordinator = activeCoordinator()
++        coordinator.onTopBoundaryDrag(
++            deltaY = 100f,
++            imeVisible = true,
++            overscrollLimitPx = 1000f,
++            revealPullThresholdPx = 50f,
++        )
++
++        val (consumed, effect) = coordinator.onPreScroll(
++            deltaY = -30f,
++            imeVisible = false,
++            contentOverflowAboveImePx = 0f,
++            collapseOverflowThresholdPx = 0f,
++        )
++
++        assertEquals(-30f, consumed, 0.0001f)
++        assertEquals(SearchPreScrollEffect.None, effect)
++        assertEquals(70f, coordinator.interaction.rawOverscrollPx, 0.0001f)
++    }
++
++    @Test fun clearingQueryDoesNotResetTheSharedTopPullState() {
++        val coordinator = activeCoordinator("flower")
++        coordinator.onTopBoundaryDrag(
++            deltaY = 80f,
++            imeVisible = true,
++            overscrollLimitPx = 1000f,
++            revealPullThresholdPx = 300f,
++        )
++        val before = coordinator.interaction.rawOverscrollPx
++
++        coordinator.dispatch(SearchIntent.QueryChanged(""))
++
++        assertEquals(before, coordinator.interaction.rawOverscrollPx, 0.0001f)
++    }
++}
+diff --git a/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt b/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt
+index 3c49891..4acff3c 100644
+--- a/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt
++++ b/app/src/test/java/com/flower/launcher/ui/VerticalPageTransitionControllerTest.kt
+@@ -22,14 +22,12 @@ class VerticalPageTransitionControllerTest {
+         assertFalse(controller.ownsInteraction(owner))
+     }
+ 
+-    @Test fun leavingCompositionInvalidatesBothPageAndLocalPullOwnership() = runTest {
++    @Test fun leavingCompositionInvalidatesPageOwnership() = runTest {
+         val controller = VerticalPageTransitionController(this)
+-        val page = controller.beginInteractive()
+-        val pull = controller.beginSearchPull()
+-        assertFalse(controller.ownsInteraction(page))
+-        assertTrue(controller.ownsInteraction(pull))
++        val owner = controller.beginInteractive()
++        assertTrue(controller.ownsInteraction(owner))
+         controller.dispose()
+-        assertFalse(controller.ownsInteraction(pull))
++        assertFalse(controller.ownsInteraction(owner))
+         assertTrue(controller.isDisposed)
+     }
+ 
+diff --git a/verification/run_current_checks.sh b/verification/run_current_checks.sh
+index 46730bb..d251e15 100644
+--- a/verification/run_current_checks.sh
++++ b/verification/run_current_checks.sh
+@@ -5,4 +5,5 @@ cd "$project_dir"
+ 
+ # A small compatibility smoke check. This does NOT replace the behavioral tests.
+ python3 verification/verify_v61_gesture_coordinator.py
++python3 verification/verify_v70_unified_search_pull.py
+ bash ./gradlew :app:testDebugUnitTest :app:assembleDebug
+diff --git a/shepherd_work/verification/verify_v70_unified_search_pull.py b/verification/verify_v70_unified_search_pull.py
+new file mode 100755
+index 0000000..d284fb6
+--- /dev/null
++++ b/verification/verify_v70_unified_search_pull.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++ui = root / 'app/src/main/java/com/flower/launcher/ui'
++sc = (ui / 'SearchCoordinator.kt').read_text()
++content = (ui / 'SearchContent.kt').read_text()
++launcher = (ui / 'LauncherRoot.kt').read_text()
++vertical = (ui / 'VerticalPageTransitionController.kt').read_text()
++test = (root / 'app/src/test/java/com/flower/launcher/ui/SearchCoordinatorTest.kt').read_text()
++
++
++def between(text: str, start: str, end: str) -> str:
++    a = text.index(start)
++    b = text.index(end, a)
++    return text[a:b]
++
++
++top = between(sc, 'fun onTopBoundaryDrag(', 'fun onBottomBoundaryDrag(')
++bottom = between(sc, 'fun onBottomBoundaryDrag(', 'fun beginInteractive()')
++pre = between(sc, 'fun onPreScroll(', 'fun onTopBoundaryDrag(')
++release = between(sc, 'fun onRelease(', '\n    }\n}\n',)
++
++checks = {
++    'empty/non-empty share top boundary handler':
++        'if (!state.hasQuery)' not in top and 'interaction.addBoundaryDrag(deltaY)' in top,
++    'IME reveal threshold is query agnostic':
++        'visual >= revealPullThresholdPx' in top and 'SearchBoundaryEffect.RevealIme' in top,
++    'bottom return remains non-empty-only':
++        'if (!state.hasQuery) return SearchBoundaryEffect.None' in bottom,
++    'IME collapse behavior remains non-empty-only':
++        'state.hasQuery &&' in pre and 'SearchPreScrollEffect.HideIme' in pre,
++    'shared rebound no longer depends on query':
++        'state.hasQuery' not in release and 'interaction.startRebound' in release,
++    'SearchContent old query lock removed':
++        'queryLocked' not in content,
++    'SearchContent routes all downward boundary drag to unified top path':
++        'available.y > 0f -> coordinator.onTopBoundaryDrag(' in content,
++    'SearchContent keeps non-empty bottom path':
++        'hasQuery -> coordinator.onBottomBoundaryDrag(' in content,
++    'empty upward nested-scroll stays unconsumed for LauncherRoot':
++        'else -> Offset.Zero' in content,
++    'empty Search page-level pull no longer translates whole Search plane':
++        'searchPullOffset' not in launcher and 'translationY = transitionPullOffset.value' in launcher,
++    'stable empty Search downward pull is not consumed by LauncherRoot':
++        'mode = if (stableSearch && direction == 1) {' in launcher and '\n                                            0\n' in launcher,
++    'page ownership clears stale local Search overscroll':
++        'searchCoordinator.clearBoundaryOverscroll()' in launcher,
++    'legacy vertical Search-pull controller removed':
++        'searchPullOffset' not in vertical and 'beginSearchPull' not in vertical and 'reboundSearchPull' not in vertical,
++    'empty-query IME reveal unit regression test added':
++        'emptyQueryTopPullUsesTheSameImeRevealThreshold' in test,
++    'empty-query bottom return separation unit test added':
++        'emptyQueryDoesNotAcquireTheNonEmptyBottomReturnPath' in test,
++}
++
++failed = [name for name, ok in checks.items() if not ok]
++for name, ok in checks.items():
++    print(('PASS' if ok else 'FAIL'), name)
++if failed:
++    raise SystemExit('failed: ' + ', '.join(failed))

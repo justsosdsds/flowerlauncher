@@ -1,0 +1,12 @@
+PASS GestureCoordinator exists
+PASS Root local handoff latches removed
+PASS Search pointer-held latch removed
+PASS release intent latch removed
+PASS threshold transfer is accepted before Returning
+PASS Search threshold callback returns acceptance
+PASS same-frame release path exists
+PASS reversal settle is coordinator-owned
+PASS Root applies coordinator frames
+PASS SearchInteractionState beginInteractive is non-suspend
+PASS SearchCoordinator beginInteractive is non-suspend
+PASS cancelAndJoin absent

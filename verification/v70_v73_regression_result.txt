@@ -1,0 +1,15 @@
+PASS empty/non-empty share top boundary handler
+PASS IME reveal threshold is query agnostic
+PASS bottom return remains non-empty-only
+PASS IME collapse behavior remains non-empty-only
+PASS shared rebound no longer depends on query
+PASS SearchContent old query lock removed
+PASS SearchContent routes all downward boundary drag to unified top path
+PASS SearchContent keeps non-empty bottom path
+PASS empty upward nested-scroll stays unconsumed for LauncherRoot
+PASS empty Search page-level pull no longer translates whole Search plane
+PASS stable empty Search downward pull is not consumed by LauncherRoot
+PASS page ownership clears stale local Search overscroll
+PASS legacy vertical Search-pull controller removed
+PASS empty-query IME reveal unit regression test added
+PASS empty-query bottom return separation unit test added

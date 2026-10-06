@@ -1,0 +1,10 @@
+PASS drag-time reveal threshold
+PASS release no longer decides reveal
+PASS haptic threshold callback
+PASS single-fire reveal guard
+PASS haptic switch persisted
+PASS haptic strength persisted
+PASS interaction dedicated page
+PASS interaction entry
+PASS vibrate permission
+PASS compact return constants preserved

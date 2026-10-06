@@ -1,0 +1,73 @@
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+@@ -907,20 +907,8 @@
+             val signed = verticalPosition.value.coerceIn(-1f, 1f)
+             if (signed < 0f) {
+                 composeBlurLevel(-signed, blurStrength)
+-            } else if (verticalTransition.returningFromSearch) {
+-                val searchP = signed
+-                val returnStart = verticalTransition.searchReturnStartPosition
+-                if (searchP > returnStart) {
+-                    composeBlurLevel(searchP, blurStrength)
+-                } else {
+-                    val startBlurIndex = composeBlurLevel(returnStart, blurStrength)
+-                    (
+-                        startBlurIndex *
+-                            (1f - verticalTransition.searchReturnProgress(searchP)) +
+-                            0.5f
+-                        ).toInt().coerceIn(0, BLUR_LEVELS)
+-                }
+             } else {
++                // Search follows the existing Drawer curve, including the return trip.
+                 composeBlurLevel(signed, blurStrength)
+             }
+         }
+@@ -965,31 +953,14 @@
+                         alpha = 1f
+                         transformOrigin = TransformOrigin.Center
+                     } else {
+-                        val searchP = signed
+-                        if (verticalTransition.returningFromSearch) {
+-                            // Search -> Home: the desktop is a fixed background plane.
+-                            // Only blur is allowed to relax while the Search foreground
+-                            // performs its compact exit animation above it.
+-                            scaleX = editScale
+-                            scaleY = editScale
+-                            translationY = 0f
+-                            alpha = 1f
+-                            transformOrigin = TransformOrigin.Center
+-                        } else {
+-                            val eased = easeOutCubic(searchP)
+-                            val scale = (1f - HOME_SCALE_DROP * eased) * editScale
+-                            scaleX = scale
+-                            scaleY = scale
+-                            // Keep Home spatially anchored on the Search side as well.
+-                            // transitionPullOffset can contain the entire Drawer -> Home
+-                            // travel during a continuous cross-page drag; applying it here
+-                            // makes the desktop jump downward the moment position crosses 0.
+-                            // Search owns the foreground motion, while Home only supplies
+-                            // depth via scale/alpha/blur.
+-                            translationY = 0f
+-                            alpha = 1f - HOME_ALPHA_DROP * eased
+-                            transformOrigin = TransformOrigin(0.5f, 0.15f)
+-                        }
++                        // Match Drawer background compositing. Fading this cache would
++                        // reveal the sharp wallpaper underneath and weaken Search blur.
++                        // Search foreground animations remain on their own layer below.
++                        scaleX = editScale
++                        scaleY = editScale
++                        translationY = 0f
++                        alpha = 1f
++                        transformOrigin = TransformOrigin.Center
+                     }
+                 },
+         ) {
+@@ -1626,8 +1597,6 @@
+ private const val DRAWER_HANDOFF_FLING_FRICTION = 5.5f
+ private const val DRAWER_HANDOFF_FLING_STOP_VELOCITY_PX = 45f
+ private const val KEYBOARD_TRIGGER_PROGRESS = 0.055f
+-private const val HOME_SCALE_DROP = 0.012f
+-private const val HOME_ALPHA_DROP = 0.16f
+ private const val HOME_PULL_LIMIT_RATIO = 0.34f
+ private const val HOME_BLUR_SATURATION_PROGRESS = 0.58f
+ private const val SEARCH_SCALE_MIN = 0.985f

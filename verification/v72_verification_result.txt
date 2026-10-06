@@ -1,0 +1,54 @@
+V61
+PASS GestureCoordinator exists
+PASS Root local handoff latches removed
+PASS Search pointer-held latch removed
+PASS release intent latch removed
+PASS threshold transfer is accepted before Returning
+PASS Search threshold callback returns acceptance
+PASS same-frame release path exists
+PASS reversal settle is coordinator-owned
+PASS Root applies coordinator frames
+PASS SearchInteractionState beginInteractive is non-suspend
+PASS SearchCoordinator beginInteractive is non-suspend
+PASS cancelAndJoin absent
+
+V70
+PASS empty/non-empty share top boundary handler
+PASS IME reveal threshold is query agnostic
+PASS bottom return remains non-empty-only
+PASS IME collapse behavior remains non-empty-only
+PASS shared rebound no longer depends on query
+PASS SearchContent old query lock removed
+PASS SearchContent routes all downward boundary drag to unified top path
+PASS SearchContent keeps non-empty bottom path
+PASS empty upward nested-scroll stays unconsumed for LauncherRoot
+PASS empty Search page-level pull no longer translates whole Search plane
+PASS stable empty Search downward pull is not consumed by LauncherRoot
+PASS page ownership clears stale local Search overscroll
+PASS legacy vertical Search-pull controller removed
+PASS empty-query IME reveal unit regression test added
+PASS empty-query bottom return separation unit test added
+
+V72
+PASS explicit Input/Expanded presentation model exists
+PASS SearchState owns presentation target
+PASS legacy pending keyboard event state removed
+PASS legacy auto keyboard intent removed
+PASS fresh Search session deterministically targets Input
+PASS launcher uses declarative page-progress gate
+PASS 5.5 percent keyboard timing is preserved
+PASS IME request derives from Input target rather than event latch
+PASS manual IME dismissal can enter Expanded
+PASS programmatic hides are distinguished in SearchContent
+PASS field focus explicitly returns Search to Input
+PASS non-empty overflow collapse targets Expanded
+PASS top pull reveal is available only from Expanded and returns Input
+PASS page return suppression does not overwrite presentation target
+PASS same-pointer return reversal explicitly restores Input target
+PASS new session Input regression test exists
+PASS manual dismiss Expanded regression test exists
+PASS programmatic hide regression test exists
+PASS pull reveal mode transition regression test exists
+
+GRADLE
+BLOCKED: Gradle 8.13 wrapper download from mirrors.aliyun.com failed with UnknownHostException.

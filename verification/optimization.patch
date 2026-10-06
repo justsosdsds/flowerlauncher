@@ -1,0 +1,1051 @@
+--- a/app/src/main/java/com/flower/launcher/MainActivity.kt
++++ b/app/src/main/java/com/flower/launcher/MainActivity.kt
+@@ -3,10 +3,12 @@
+ import android.app.WallpaperManager
+ import android.appwidget.AppWidgetHost
+ import android.appwidget.AppWidgetManager
++import android.appwidget.AppWidgetProviderInfo
+ import android.content.ActivityNotFoundException
+ import android.content.ComponentName
+ import android.content.Intent
+ import android.os.Bundle
++import android.util.Log
+ import android.view.WindowManager
+ import android.view.inputmethod.InputMethodManager
+ import android.widget.Toast
+@@ -17,14 +19,12 @@
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+-import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.setValue
+-import com.flower.launcher.apps.AppRepository
++import androidx.lifecycle.ViewModelProvider
++import com.flower.launcher.apps.AppListViewModel
+ import com.flower.launcher.apps.InstalledApp
+ import com.flower.launcher.ui.LauncherRoot
+ import com.flower.launcher.ui.theme.FlowerLauncherTheme
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.withContext
+ 
+ class MainActivity : ComponentActivity() {
+ 
+@@ -33,6 +33,7 @@
+     private var widgetHeights by mutableStateOf<Map<Int, Int>>(emptyMap())
+     private lateinit var appWidgetHost: AppWidgetHost
+     private lateinit var appWidgetManager: AppWidgetManager
++    private lateinit var appListViewModel: AppListViewModel
+     private var pendingWidgetId: Int? = null
+     private var configuringExistingWidget: Boolean = false
+ 
+@@ -40,38 +41,35 @@
+         ActivityResultContracts.StartActivityForResult(),
+     ) { result ->
+         val id = pendingWidgetId ?: return@registerForActivityResult
+-        if (result.resultCode == RESULT_OK) {
++        if (result.resultCode == RESULT_OK && widgetInfo(id) != null) {
+             commitWidget(id)
+         } else if (!configuringExistingWidget) {
+-            appWidgetHost.deleteAppWidgetId(id)
+-        }
+-        pendingWidgetId = null
+-        configuringExistingWidget = false
++            releaseWidgetId(id)
++        }
++        clearPendingWidget()
+     }
+ 
+     private val widgetPickerLauncher = registerForActivityResult(
+         ActivityResultContracts.StartActivityForResult(),
+     ) { result ->
+-        val fallbackId = pendingWidgetId ?: return@registerForActivityResult
+-        val id = result.data?.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, fallbackId) ?: fallbackId
+-
+-        if (result.resultCode != RESULT_OK) {
+-            appWidgetHost.deleteAppWidgetId(id)
+-            pendingWidgetId = null
++        val id = pendingWidgetId ?: return@registerForActivityResult
++        val returnedId = result.data?.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id) ?: id
++        if (result.resultCode != RESULT_OK || returnedId != id) {
++            // Only release the ID allocated by this host for this request.
++            releaseWidgetId(id)
++            clearPendingWidget()
+             return@registerForActivityResult
+         }
+-
+-        val info = appWidgetManager.getAppWidgetInfo(id)
+-        val configure = info?.configure
+-        if (configure != null) {
+-            val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_CONFIGURE).apply {
+-                component = configure
+-                putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+-            }
+-            widgetConfigureLauncher.launch(intent)
++        val info = widgetInfo(id)
++        if (info == null) {
++            releaseWidgetId(id)
++            clearPendingWidget()
++            showWidgetFailure()
++        } else if (info.configure != null) {
++            launchWidgetConfiguration(id, info.configure, existing = false)
+         } else {
+             commitWidget(id)
+-            pendingWidgetId = null
++            clearPendingWidget()
+         }
+     }
+ 
+@@ -85,20 +83,18 @@
+ 
+         appWidgetManager = AppWidgetManager.getInstance(this)
+         appWidgetHost = AppWidgetHost(this, APP_WIDGET_HOST_ID)
++        pendingWidgetId = savedInstanceState?.getInt(KEY_PENDING_WIDGET_ID, -1)?.takeIf { it > 0 }
++        configuringExistingWidget = savedInstanceState?.getBoolean(KEY_CONFIGURING_EXISTING, false) ?: false
+         clearHomeWidgetsForV24Once()
+         widgetIds = loadWidgetIds()
+         widgetHeights = loadWidgetHeights()
++        appListViewModel = ViewModelProvider(this)[AppListViewModel::class.java]
++        appListViewModel.load(applicationContext)
+ 
+         setContent {
+             FlowerLauncherTheme {
+-                val apps by produceState(initialValue = emptyList<InstalledApp>()) {
+-                    value = withContext(Dispatchers.IO) {
+-                        AppRepository(applicationContext).loadLaunchableApps()
+-                    }
+-                }
+-
+                 LauncherRoot(
+-                    apps = apps,
++                    apps = appListViewModel.apps,
+                     resetSignal = resetSignal,
+                     widgetIds = widgetIds,
+                     widgetHeights = widgetHeights,
+@@ -117,6 +113,8 @@
+ 
+     override fun onStart() {
+         super.onStart()
++        // Usually a no-op; retry a failed catalog load on the next foreground entry.
++        appListViewModel.load(applicationContext)
+         runCatching { appWidgetHost.startListening() }
+     }
+ 
+@@ -131,32 +129,81 @@
+         resetSignal++
+     }
+ 
++    override fun onSaveInstanceState(outState: Bundle) {
++        pendingWidgetId?.let { outState.putInt(KEY_PENDING_WIDGET_ID, it) }
++        outState.putBoolean(KEY_CONFIGURING_EXISTING, configuringExistingWidget)
++        super.onSaveInstanceState(outState)
++    }
++
+     private fun pickWidget() {
+-        val id = appWidgetHost.allocateAppWidgetId()
++        if (pendingWidgetId != null) return
++        val id = try {
++            appWidgetHost.allocateAppWidgetId()
++        } catch (exception: RuntimeException) {
++            Log.w("MainActivity", "Unable to allocate widget", exception)
++            showWidgetFailure()
++            return
++        }
+         pendingWidgetId = id
+         configuringExistingWidget = false
+         val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_PICK).apply {
+             putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+         }
+-        runCatching { widgetPickerLauncher.launch(intent) }
+-            .onFailure {
+-                appWidgetHost.deleteAppWidgetId(id)
+-                pendingWidgetId = null
+-                Toast.makeText(this, "系统未提供小部件选择器", Toast.LENGTH_SHORT).show()
+-            }
+-    }
+-
++        try {
++            widgetPickerLauncher.launch(intent)
++        } catch (exception: RuntimeException) {
++            Log.w("MainActivity", "Unable to open widget picker", exception)
++            releaseWidgetId(id)
++            clearPendingWidget()
++            Toast.makeText(this, "系统未提供小部件选择器", Toast.LENGTH_SHORT).show()
++        }
++    }
+ 
+     private fun configureWidget(id: Int) {
+-        val info = appWidgetManager.getAppWidgetInfo(id) ?: return
+-        val configure = info.configure ?: return
++        if (pendingWidgetId != null) return
++        val configure = widgetInfo(id)?.configure ?: return
++        launchWidgetConfiguration(id, configure, existing = true)
++    }
++
++    private fun launchWidgetConfiguration(id: Int, configure: ComponentName, existing: Boolean) {
+         pendingWidgetId = id
+-        configuringExistingWidget = true
++        configuringExistingWidget = existing
+         val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_CONFIGURE).apply {
+             component = configure
+             putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+         }
+-        widgetConfigureLauncher.launch(intent)
++        try {
++            widgetConfigureLauncher.launch(intent)
++        } catch (exception: RuntimeException) {
++            Log.w("MainActivity", "Unable to configure widget", exception)
++            if (!existing) releaseWidgetId(id)
++            clearPendingWidget()
++            showWidgetFailure()
++        }
++    }
++
++    private fun widgetInfo(id: Int): AppWidgetProviderInfo? = try {
++        appWidgetManager.getAppWidgetInfo(id)
++    } catch (exception: RuntimeException) {
++        Log.w("MainActivity", "Unable to read widget $id", exception)
++        null
++    }
++
++    private fun releaseWidgetId(id: Int) {
++        try {
++            appWidgetHost.deleteAppWidgetId(id)
++        } catch (exception: RuntimeException) {
++            Log.w("MainActivity", "Unable to release widget $id", exception)
++        }
++    }
++
++    private fun clearPendingWidget() {
++        pendingWidgetId = null
++        configuringExistingWidget = false
++    }
++
++    private fun showWidgetFailure() {
++        Toast.makeText(this, "无法加载或配置该小部件", Toast.LENGTH_SHORT).show()
+     }
+ 
+     private fun removeWidget(id: Int) {
+@@ -164,11 +211,13 @@
+         widgetHeights = widgetHeights - id
+         saveWidgetIds(widgetIds)
+         saveWidgetHeights(widgetHeights)
+-        runCatching { appWidgetHost.deleteAppWidgetId(id) }
++        releaseWidgetId(id)
+     }
+ 
+     private fun setWidgetHeight(id: Int, heightDp: Int) {
+-        widgetHeights = widgetHeights + (id to heightDp.coerceIn(96, 320))
++        val height = heightDp.coerceIn(96, 320)
++        if (widgetHeights[id] == height) return
++        widgetHeights = widgetHeights + (id to height)
+         saveWidgetHeights(widgetHeights)
+     }
+ 
+@@ -187,7 +236,7 @@
+         val oldIds = prefs.getStringSet(KEY_WIDGET_IDS, emptySet())
+             .orEmpty()
+             .mapNotNull(String::toIntOrNull)
+-        oldIds.forEach { id -> runCatching { appWidgetHost.deleteAppWidgetId(id) } }
++        oldIds.forEach { id -> releaseWidgetId(id) }
+ 
+         prefs.edit()
+             .remove(KEY_WIDGET_IDS)
+@@ -199,7 +248,7 @@
+         .getStringSet(KEY_WIDGET_IDS, emptySet())
+         .orEmpty()
+         .mapNotNull(String::toIntOrNull)
+-        .filter { appWidgetManager.getAppWidgetInfo(it) != null }
++        .filter { widgetInfo(it) != null }
+         .sorted()
+ 
+     private fun saveWidgetIds(ids: List<Int>) {
+@@ -211,7 +260,7 @@
+ 
+     private fun loadWidgetHeights(): Map<Int, Int> {
+         val prefs = getSharedPreferences(WIDGET_PREFS, MODE_PRIVATE)
+-        return widgetIds.associateWith { id -> prefs.getInt("widget_height_$id", 138) }
++        return widgetIds.associateWith { id -> prefs.getInt("widget_height_$id", 138).coerceIn(96, 320) }
+     }
+ 
+     private fun saveWidgetHeights(values: Map<Int, Int>) {
+@@ -250,11 +299,14 @@
+     }
+ 
+     private fun openFallbackLaunchIntent(app: InstalledApp) {
+-        val fallbackIntent = packageManager
+-            .getLaunchIntentForPackage(app.packageName)
+-            ?.apply {
++        val fallbackIntent = try {
++            packageManager.getLaunchIntentForPackage(app.packageName)?.apply {
+                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+             }
++        } catch (exception: RuntimeException) {
++            Log.w("MainActivity", "Unable to resolve fallback launch intent", exception)
++            null
++        }
+ 
+         if (fallbackIntent == null) {
+             showLaunchFailure(app.label)
+@@ -280,6 +332,8 @@
+     }
+ 
+     private companion object {
++        const val KEY_PENDING_WIDGET_ID = "pending_widget_id"
++        const val KEY_CONFIGURING_EXISTING = "configuring_existing_widget"
+         const val APP_WIDGET_HOST_ID = 0x464C4F57
+         const val WIDGET_PREFS = "flower_widgets"
+         const val KEY_WIDGET_IDS = "widget_ids"
+--- a/app/src/main/java/com/flower/launcher/apps/AppCustomizationRepository.kt
++++ b/app/src/main/java/com/flower/launcher/apps/AppCustomizationRepository.kt
+@@ -21,6 +21,7 @@
+     }
+ 
+     fun setHidden(current: AppCustomizations, componentKey: String, hidden: Boolean): AppCustomizations {
++        if ((componentKey in current.hiddenComponentKeys) == hidden) return current
+         val updated = if (hidden) {
+             current.hiddenComponentKeys + componentKey
+         } else {
+@@ -32,6 +33,7 @@
+ 
+     fun setAlias(current: AppCustomizations, componentKey: String, alias: String?): AppCustomizations {
+         val normalized = alias?.trim().orEmpty()
++        if (current.aliases[componentKey].orEmpty() == normalized) return current
+         val updated = current.aliases.toMutableMap().apply {
+             if (normalized.isBlank()) remove(componentKey) else put(componentKey, normalized)
+         }.toMap()
+--- /dev/null
++++ b/app/src/main/java/com/flower/launcher/apps/AppListViewModel.kt
+@@ -0,0 +1,53 @@
++package com.flower.launcher.apps
++
++import android.content.Context
++import android.util.Log
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.lifecycle.ViewModel
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** Retains the icon catalog across Activity recreation, without retaining the Activity. */
++class AppListViewModel : ViewModel() {
++    var apps by mutableStateOf<List<InstalledApp>>(emptyList())
++        private set
++
++    private val loadingScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
++    private var catalogKey: String? = null
++    private var loadJob: Job? = null
++
++    fun load(context: Context) {
++        val appContext = context.applicationContext
++        val configuration = context.resources.configuration
++        val key = "${configuration.locales.toLanguageTags()}:${configuration.densityDpi}:${configuration.uiMode}"
++        if (catalogKey == key) return
++        catalogKey = key
++        loadJob?.cancel()
++        loadJob = loadingScope.launch {
++            try {
++                apps = withContext(Dispatchers.IO) {
++                    AppRepository(appContext).loadLaunchableApps()
++                }
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (exception: RuntimeException) {
++                // A PackageManager/binder failure must not terminate the Home activity.
++                catalogKey = null
++                Log.e("AppListViewModel", "Unable to load installed apps", exception)
++            }
++        }
++    }
++
++    override fun onCleared() {
++        loadingScope.cancel()
++        super.onCleared()
++    }
++}
+--- a/app/src/main/java/com/flower/launcher/apps/AppRepository.kt
++++ b/app/src/main/java/com/flower/launcher/apps/AppRepository.kt
+@@ -4,15 +4,18 @@
+ import android.content.Intent
+ import android.content.pm.PackageManager
+ import android.os.Build
++import android.util.Log
+ import androidx.compose.ui.graphics.asImageBitmap
+ import androidx.core.graphics.drawable.toBitmap
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.ensureActive
+ 
+ class AppRepository(context: Context) {
+ 
+     private val packageManager = context.packageManager
+     private val ownPackageName = context.packageName
+ 
+-    fun loadLaunchableApps(): List<InstalledApp> {
++    suspend fun loadLaunchableApps(): List<InstalledApp> {
+         val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
+             addCategory(Intent.CATEGORY_LAUNCHER)
+         }
+@@ -27,20 +30,27 @@
+             packageManager.queryIntentActivities(launcherIntent, 0)
+         }
+ 
++        val loadingContext = currentCoroutineContext()
++        val seenComponents = HashSet<String>()
+         return resolvedActivities
+             .asSequence()
+             .mapNotNull { resolveInfo ->
++                loadingContext.ensureActive()
+                 val activityInfo = resolveInfo.activityInfo ?: return@mapNotNull null
+                 val packageName = activityInfo.packageName ?: return@mapNotNull null
+                 val activityName = activityInfo.name ?: return@mapNotNull null
+ 
+                 if (packageName == ownPackageName) return@mapNotNull null
++                // Filter duplicate resolver entries before decoding their bitmaps.
++                if (!seenComponents.add("$packageName/$activityName")) return@mapNotNull null
+ 
+-                val label = resolveInfo
+-                    .loadLabel(packageManager)
+-                    .toString()
+-                    .trim()
+-                    .ifEmpty { packageName }
++                val label = try {
++                    resolveInfo.loadLabel(packageManager).toString().trim().ifEmpty { packageName }
++                } catch (exception: RuntimeException) {
++                    // Packages can disappear between query and resource loading.
++                    Log.w("AppRepository", "Unable to load label for $packageName", exception)
++                    packageName
++                }
+ 
+                 val icon = runCatching {
+                     resolveInfo
+@@ -56,8 +66,7 @@
+                     icon = icon,
+                 )
+             }
+-            .distinctBy(InstalledApp::componentKey)
+-            .sortedBy { it.label.lowercase() }
++            .sortedBy { it.searchLabel }
+             .toList()
+     }
+ 
+--- a/app/src/main/java/com/flower/launcher/apps/AppSearchEngine.kt
++++ b/app/src/main/java/com/flower/launcher/apps/AppSearchEngine.kt
+@@ -1,33 +1,38 @@
+ package com.flower.launcher.apps
+ 
+ object AppSearchEngine {
++    fun prepare(apps: List<InstalledApp>): AppSearchIndex = AppSearchIndex(apps)
+ 
+-    fun search(apps: List<InstalledApp>, query: String): List<InstalledApp> {
+-        val trimmed = query.trim()
+-        if (trimmed.isEmpty()) return apps
++    fun search(apps: List<InstalledApp>, query: String): List<InstalledApp> =
++        prepare(apps).search(query)
++}
+ 
+-        val needle = trimmed.lowercase()
++/** One index per app/alias list. Preserves the original score and stable tie order. */
++class AppSearchIndex internal constructor(private val apps: List<InstalledApp>) {
++    private val alphabetical = apps.sortedBy { it.searchLabel }
+ 
+-        return apps
+-            .mapNotNull { app ->
+-                val score = score(app, needle)
+-                if (score < 0) null else app to score
++    fun search(query: String): List<InstalledApp> {
++        val needle = query.trim().lowercase()
++        if (needle.isEmpty()) return apps
++
++        // Already sorted within each score: no Pair allocations or query-time sorting.
++        val exact = ArrayList<InstalledApp>()
++        val prefix = ArrayList<InstalledApp>()
++        val contains = ArrayList<InstalledApp>()
++        val packages = ArrayList<InstalledApp>()
++        for (app in alphabetical) {
++            when {
++                app.searchLabel == needle -> exact.add(app)
++                app.searchLabel.startsWith(needle) -> prefix.add(app)
++                app.searchLabel.contains(needle) -> contains.add(app)
++                app.searchPackageName.contains(needle) -> packages.add(app)
+             }
+-            .sortedWith(
+-                compareByDescending<Pair<InstalledApp, Int>> { it.second }
+-                    .thenBy { it.first.label.lowercase() },
+-            )
+-            .map { it.first }
+-    }
+-
+-    private fun score(app: InstalledApp, needle: String): Int {
+-        val label = app.label.lowercase()
+-        return when {
+-            label == needle -> 4
+-            label.startsWith(needle) -> 3
+-            label.contains(needle) -> 2
+-            app.packageName.lowercase().contains(needle) -> 1
+-            else -> -1
++        }
++        return ArrayList<InstalledApp>(exact.size + prefix.size + contains.size + packages.size).apply {
++            addAll(exact)
++            addAll(prefix)
++            addAll(contains)
++            addAll(packages)
+         }
+     }
+ }
+--- a/app/src/main/java/com/flower/launcher/apps/InstalledApp.kt
++++ b/app/src/main/java/com/flower/launcher/apps/InstalledApp.kt
+@@ -8,6 +8,8 @@
+     val activityName: String,
+     val icon: ImageBitmap? = null,
+ ) {
+-    val componentKey: String
+-        get() = "$packageName/$activityName"
++    // Recomputed by copy() when an alias changes, never per frame/query.
++    val componentKey: String = "$packageName/$activityName"
++    internal val searchLabel: String = label.lowercase()
++    internal val searchPackageName: String = packageName.lowercase()
+ }
+--- a/app/src/main/java/com/flower/launcher/ui/AllAppsContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/AllAppsContent.kt
+@@ -106,7 +106,7 @@
+     val source = if (showHiddenOnly) hiddenApps else apps
+     val displayedApps = remember(source, sortMode) {
+         when (sortMode) {
+-            DrawerSortMode.Name -> source.sortedBy { it.label.lowercase() }
++            DrawerSortMode.Name -> source.sortedBy { it.searchLabel }
+             DrawerSortMode.InstallTime -> source // install time metadata is not stored yet
+             DrawerSortMode.Usage -> source // usage statistics permission/metadata is not wired yet
+             DrawerSortMode.Manual -> source
+--- a/app/src/main/java/com/flower/launcher/ui/HomeContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/HomeContent.kt
+@@ -23,7 +23,7 @@
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.produceState
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+@@ -47,11 +47,8 @@
+ import com.flower.launcher.home.HomePreferences
+ import com.flower.launcher.ui.theme.OnHomePrimary
+ import com.flower.launcher.ui.theme.OnHomeSecondary
+-import java.time.LocalDateTime
+ import java.time.format.DateTimeFormatter
+-import java.util.Locale
+ import kotlin.math.roundToInt
+-import kotlinx.coroutines.delay
+ 
+ @Composable
+ fun HomeContent(
+@@ -148,14 +145,13 @@
+     offsetX: Int,
+     offsetY: Int,
+ ) {
+-    val now by produceState(initialValue = LocalDateTime.now()) {
+-        while (true) {
+-            value = LocalDateTime.now()
+-            delay(1_000L)
+-        }
+-    }
+-
+-    val family = clockFontFamily(font, fontWeight)
++    val clock by rememberMinuteClock()
++    val timeFormatter = remember(clock.locale) { DateTimeFormatter.ofPattern("HH:mm", clock.locale) }
++    val dateFormatter = remember(clock.locale) {
++        val pattern = if (clock.locale.language.startsWith("zh")) "M月d日 EEE" else "EEE, d MMM"
++        DateTimeFormatter.ofPattern(pattern, clock.locale)
++    }
++    val family = remember(font, fontWeight) { clockFontFamily(font, fontWeight) }
+     val weight = FontWeight(fontWeight)
+     val dateSizeSp = (fontSizeSp * 0.205f).roundToInt().coerceAtLeast(10)
+ 
+@@ -172,7 +168,7 @@
+         horizontalAlignment = Alignment.CenterHorizontally,
+     ) {
+         Text(
+-            text = now.format(TIME_FORMATTER),
++            text = clock.time.format(timeFormatter),
+             color = timeColor,
+             fontFamily = family,
+             fontSize = fontSizeSp.sp,
+@@ -182,7 +178,7 @@
+         )
+         Spacer(modifier = Modifier.height(2.dp))
+         Text(
+-            text = now.format(DATE_FORMATTER),
++            text = clock.time.format(dateFormatter),
+             color = dateColor,
+             fontFamily = family,
+             fontSize = dateSizeSp.sp,
+@@ -232,10 +228,3 @@
+     offset = Offset(0f, 2f),
+     blurRadius = 14f,
+ )
+-
+-private val TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm", Locale.getDefault())
+-private val DATE_FORMATTER: DateTimeFormatter = run {
+-    val locale = Locale.getDefault()
+-    val pattern = if (locale.language.startsWith("zh")) "M月d日 EEE" else "EEE, d MMM"
+-    DateTimeFormatter.ofPattern(pattern, locale)
+-}
+--- a/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
++++ b/app/src/main/java/com/flower/launcher/ui/LauncherRoot.kt
+@@ -24,6 +24,7 @@
+ import androidx.compose.foundation.gestures.detectVerticalDragGestures
+ import androidx.compose.foundation.background
+ import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.draw.drawWithCache
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.runtime.Composable
+@@ -122,6 +123,7 @@
+     )
+ 
+     fun updateHomePreferences(value: HomePreferences) {
++        if (homePreferences == value) return
+         homePreferences = value
+         homeRepository.save(value)
+     }
+@@ -186,16 +188,19 @@
+     }
+ 
+     fun updateSearchPreferences(value: com.flower.launcher.search.SearchPreferences) {
++        if (searchPreferences == value) return
+         searchPreferences = value
+         searchRepository.save(value)
+     }
+ 
+     fun updateSearchTargets(value: List<SearchTarget>) {
++        if (searchTargets == value) return
+         searchTargets = value
+         searchTargetRepository.save(value)
+     }
+ 
+     fun updateLauncherPreferences(value: LauncherPreferences) {
++        if (launcherPreferences == value) return
+         launcherPreferences = value
+         launcherSettingsRepository.save(value)
+     }
+@@ -274,7 +279,7 @@
+         launchIntent(Intent(Intent.ACTION_DELETE, Uri.parse("package:${app.packageName}")))
+     }
+ 
+-    val customizedApps = remember(apps, appCustomizations) {
++    val customizedApps = remember(apps, appCustomizations.aliases) {
+         apps.map { app ->
+             val alias = appCustomizations.aliases[app.componentKey]
+             if (alias.isNullOrBlank()) app else app.copy(label = alias)
+@@ -282,6 +287,9 @@
+     }
+     val visibleApps = remember(customizedApps, appCustomizations.hiddenComponentKeys) {
+         customizedApps.filterNot { it.componentKey in appCustomizations.hiddenComponentKeys }
++    }
++    val hiddenDrawerApps = remember(customizedApps, appCustomizations.hiddenComponentKeys) {
++        customizedApps.filter { it.componentKey in appCustomizations.hiddenComponentKeys }
+     }
+     val searchApps = if (searchPreferences.showHiddenApps) customizedApps else visibleApps
+ 
+@@ -463,7 +471,9 @@
+     } else {
+         0f
+     }
+-    var desiredWallpaperBlurRadius by remember { mutableIntStateOf(0) }
++    val wallpaperBlurHost = remember(activity) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) activity?.let(::WallpaperBlurHost) else null
++    }
+     val homeBlurEffects: List<RenderEffect?> = remember(density, blurStrength) {
+         val maxRadius = with(density) { HOME_BLUR_MAX.toPx() } * blurStrength
+         List(BLUR_LEVELS + 1) { index ->
+@@ -479,12 +489,13 @@
+     // Search keeps the full Gaussian blur. All Apps uses the same mechanism at a
+     // deliberately lower strength so both transitions speak the same visual language
+     // without making the app drawer feel as heavy as Search. Window dim stays disabled.
+-    LaunchedEffect(
+-        activity,
+-        blurStrength,
+-        verticalTransition.searchLayerActive,
+-        verticalTransition.drawerLayerActive,
+-    ) {
++    // Layer flags are already observed by snapshotFlow; they need not restart it.
++    LaunchedEffect(activity, blurStrength, verticalTransition) {
++        val host = wallpaperBlurHost ?: return@LaunchedEffect
++        if (blurStrength <= 0f) {
++            host.update(0)
++            return@LaunchedEffect
++        }
+         snapshotFlow {
+             val signed = verticalPosition.value.coerceIn(-1f, 1f)
+             val searchLevel = if (verticalTransition.searchLayerActive) {
+@@ -505,48 +516,12 @@
+             .distinctUntilChanged()
+             .collect { level ->
+                 val radius = (WALLPAPER_BLUR_MAX_PX * level / BLUR_LEVELS).toInt()
+-                desiredWallpaperBlurRadius = radius
+-                activity?.let { host ->
+-                    host.setWallpaperBlurWithoutDim(radius)
+-                    // Blur-behind is a window attribute and the Compose RenderEffect
+-                    // lives on the Home layer. The drawer path keeps that layer visually
+-                    // static, so without an explicit repaint HWUI can keep serving the
+-                    // previous frame and the newly requested blur only appears once
+-                    // something external (e.g. a screenshot) forces a redraw.
+-                    // Force one here whenever the blur level changes.
+-                    host.window.decorView.postOnAnimation {
+-                        host.window.decorView.invalidate()
+-                    }
+-                    // Some OEM compositors rebuild the translucent launcher window on
+-                    // the same frame that a transition starts. Re-assert the desired
+-                    // blur on the next UI frame so FLAG_BLUR_BEHIND cannot be lost.
+-                    if (radius > 0) {
+-                        host.window.decorView.post {
+-                            host.setWallpaperBlurWithoutDim(desiredWallpaperBlurRadius)
+-                        }
+-                    }
+-                }
+-            }
+-    }
+-    DisposableEffect(activity) {
+-        val decorView = activity?.window?.decorView
+-        val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+-            if (hasFocus) {
+-                // Blur-behind is a window attribute. Some systems clear/recreate it
+-                // across focus changes even though our transition progress is unchanged.
+-                // Re-applying the current desired radius makes stable Search/All Apps
+-                // recover their Gaussian blur immediately.
+-                activity?.setWallpaperBlurWithoutDim(desiredWallpaperBlurRadius)
+-            }
+-        }
+-        decorView?.viewTreeObserver?.addOnWindowFocusChangeListener(focusListener)
+-        onDispose {
+-            val observer = decorView?.viewTreeObserver
+-            if (observer != null && observer.isAlive) {
+-                observer.removeOnWindowFocusChangeListener(focusListener)
+-            }
+-            activity?.setWallpaperBlurWithoutDim(0)
+-        }
++                host.update(radius)
++            }
++    }
++    DisposableEffect(wallpaperBlurHost) {
++        wallpaperBlurHost?.attach()
++        onDispose { wallpaperBlurHost?.dispose() }
+     }
+ 
+     Box(
+@@ -813,24 +788,22 @@
+                 modifier = Modifier
+                     .fillMaxSize()
+                     .zIndex(1.25f)
+-                    .drawBehind {
+-                        val p = (-verticalPosition.value).coerceIn(0f, 1f)
+-                        val delayed = ((p - DRAWER_SCRIM_DELAY) / (1f - DRAWER_SCRIM_DELAY))
+-                            .coerceIn(0f, 1f)
+-                        val fade = smoothStep(delayed)
+-                        if (fade > 0f) {
+-                            drawRect(
+-                                brush = Brush.verticalGradient(
+-                                    0f to SearchScrim.copy(alpha = DRAWER_SCRIM_TOP_ALPHA * fade),
+-                                    0.58f to SearchScrim.copy(alpha = DRAWER_SCRIM_MID_ALPHA * fade),
+-                                    1f to SearchScrim.copy(alpha = DRAWER_SCRIM_BOTTOM_ALPHA * fade),
+-                                ),
+-                            )
++                    .drawWithCache {
++                        val brush = Brush.verticalGradient(
++                            0f to SearchScrim.copy(alpha = DRAWER_SCRIM_TOP_ALPHA),
++                            0.58f to SearchScrim.copy(alpha = DRAWER_SCRIM_MID_ALPHA),
++                            1f to SearchScrim.copy(alpha = DRAWER_SCRIM_BOTTOM_ALPHA),
++                        )
++                        onDrawBehind {
++                            val p = (-verticalPosition.value).coerceIn(0f, 1f)
++                            val delayed = ((p - DRAWER_SCRIM_DELAY) / (1f - DRAWER_SCRIM_DELAY))
++                                .coerceIn(0f, 1f)
++                            val fade = smoothStep(delayed)
++                            if (fade > 0f) drawRect(brush = brush, alpha = fade)
+                         }
+                     },
+             )
+ 
+-            val hiddenDrawerApps = customizedApps.filter { it.componentKey in appCustomizations.hiddenComponentKeys }
+             Box(
+                 modifier = Modifier
+                     .fillMaxSize()
+@@ -1080,6 +1053,44 @@
+     else -> null
+ }
+ 
++/** Coalesce queued work and remove callbacks before the window is released. */
++private class WallpaperBlurHost(private val activity: Activity) {
++    private val decorView = activity.window.decorView
++    private var desiredRadius = 0
++    private var disposed = false
++    private val repaint = Runnable { if (!disposed) decorView.invalidate() }
++    private val reassert = Runnable {
++        if (!disposed) activity.setWallpaperBlurWithoutDim(desiredRadius)
++    }
++    private val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
++        if (hasFocus && !disposed) activity.setWallpaperBlurWithoutDim(desiredRadius)
++    }
++
++    fun attach() {
++        decorView.viewTreeObserver.addOnWindowFocusChangeListener(focusListener)
++    }
++
++    fun update(radius: Int) {
++        if (disposed) return
++        desiredRadius = radius
++        activity.setWallpaperBlurWithoutDim(radius)
++        // Keep the existing OEM blur recovery. Only stale queued requests are removed.
++        decorView.removeCallbacks(repaint)
++        decorView.removeCallbacks(reassert)
++        decorView.postOnAnimation(repaint)
++        if (radius > 0) decorView.post(reassert)
++    }
++
++    fun dispose() {
++        disposed = true
++        decorView.removeCallbacks(repaint)
++        decorView.removeCallbacks(reassert)
++        val observer = decorView.viewTreeObserver
++        if (observer.isAlive) observer.removeOnWindowFocusChangeListener(focusListener)
++        activity.setWallpaperBlurWithoutDim(0)
++    }
++}
++
+ private fun Activity.setWallpaperBlurWithoutDim(radius: Int) {
+     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+     val safeRadius = radius.coerceAtLeast(0)
+@@ -1175,6 +1186,7 @@
+     fun beginInteractive() {
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
++        searchPullJob?.cancel()
+         reboundJob?.cancel()
+         // Both sibling pages stay renderable during an interactive gesture so the
+         // signed position can cross Home without waiting for composition/state swaps.
+@@ -1218,6 +1230,7 @@
+         targetPage = page
+         settleJob?.cancel()
+         liveSnapJob?.cancel()
++        searchPullJob?.cancel()
+         reboundJob?.cancel()
+ 
+         when (page) {
+--- /dev/null
++++ b/app/src/main/java/com/flower/launcher/ui/MinuteClock.kt
+@@ -0,0 +1,78 @@
++package com.flower.launcher.ui
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalView
++import androidx.core.content.ContextCompat
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.findViewTreeLifecycleOwner
++import java.time.LocalDateTime
++import java.time.temporal.ChronoUnit
++import java.util.Locale
++
++internal data class MinuteClockValue(val time: LocalDateTime, val locale: Locale)
++
++private fun currentMinute() = MinuteClockValue(
++    LocalDateTime.now().truncatedTo(ChronoUnit.MINUTES),
++    Locale.getDefault(),
++)
++
++/** No private polling loop: listen only while the host is visible. */
++@Composable
++internal fun rememberMinuteClock(): State<MinuteClockValue> {
++    val context = LocalContext.current
++    val view = LocalView.current
++    val clock = remember { mutableStateOf(currentMinute()) }
++    DisposableEffect(context, view) {
++        val lifecycle = view.findViewTreeLifecycleOwner()?.lifecycle
++        val receiver = object : BroadcastReceiver() {
++            override fun onReceive(context: Context?, intent: Intent?) {
++                clock.value = currentMinute()
++            }
++        }
++        val filter = IntentFilter().apply {
++            addAction(Intent.ACTION_TIME_TICK)
++            addAction(Intent.ACTION_TIME_CHANGED)
++            addAction(Intent.ACTION_TIMEZONE_CHANGED)
++            addAction(Intent.ACTION_LOCALE_CHANGED)
++        }
++        var registered = false
++        fun stop() {
++            if (registered) {
++                context.unregisterReceiver(receiver)
++                registered = false
++            }
++        }
++        fun start() {
++            if (!registered) {
++                ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
++                registered = true
++            }
++            // Covers time spent off-screen/asleep and changes while unregistered.
++            clock.value = currentMinute()
++        }
++        val observer = LifecycleEventObserver { _, event ->
++            when (event) {
++                Lifecycle.Event.ON_START -> start()
++                Lifecycle.Event.ON_STOP, Lifecycle.Event.ON_DESTROY -> stop()
++                else -> Unit
++            }
++        }
++        lifecycle?.addObserver(observer)
++        if (lifecycle == null || lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) start()
++        onDispose {
++            lifecycle?.removeObserver(observer)
++            stop()
++        }
++    }
++    return clock
++}
+--- a/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
++++ b/app/src/main/java/com/flower/launcher/ui/SearchContent.kt
+@@ -123,7 +123,15 @@
+         val token = query.trimStart()
+         token.startsWith("/") && !token.contains(' ')
+     }
+-    val results = remember(apps, effectiveQuery) { AppSearchEngine.search(apps, effectiveQuery) }
++    val searchIndex = remember(apps) { AppSearchEngine.prepare(apps) }
++    val results = remember(searchIndex, effectiveQuery) { searchIndex.search(effectiveQuery) }
++    val launchApps = remember(apps, preferences.launchAppsCount) {
++        apps.take(preferences.launchAppsCount.coerceAtLeast(0))
++    }
++    val appsByPackage = remember(apps) {
++        // Keep the first activity, matching the previous firstOrNull lookup.
++        buildMap { apps.forEach { app -> if (app.packageName !in this) put(app.packageName, app) } }
++    }
+ 
+     LaunchedEffect(requestKeyboard) {
+         if (requestKeyboard) {
+@@ -243,7 +251,6 @@
+                 },
+         ) {
+             if (trimmedQuery.isEmpty()) {
+-                val launchApps = apps.take(preferences.launchAppsCount)
+                 if (launchApps.isNotEmpty()) {
+                     SectionLabel("应用")
+                     AppGrid(
+@@ -286,7 +293,7 @@
+ 
+                 visibleTargets.forEach { target ->
+                     val appIcon = target.packageName?.let { pkg ->
+-                        apps.firstOrNull { it.packageName == pkg }?.icon
++                        appsByPackage[pkg]?.icon
+                     }
+                     val baseText = target.actionTemplate.replace(SearchTarget.NAME_PLACEHOLDER, target.label)
+                     val rowText = if (prefixMatch != null && effectiveQuery.isNotEmpty()) {
+--- /dev/null
++++ b/app/src/test/java/com/flower/launcher/apps/AppSearchEngineTest.kt
+@@ -0,0 +1,92 @@
++package com.flower.launcher.apps
++
++import kotlin.random.Random
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Test
++
++class AppSearchEngineTest {
++    @Test
++    fun blankQueryKeepsInputOrderAndIdentity() {
++        val apps = listOf(app("Zulu", 0), app("Alpha", 1))
++        val index = AppSearchEngine.prepare(apps)
++        assertSame(apps, index.search(""))
++        assertSame(apps, index.search(" \t\n"))
++        assertEquals(emptyList<InstalledApp>(), AppSearchEngine.search(emptyList(), "missing"))
++    }
++
++    @Test
++    fun scoreThenNameThenStableTiesMatchesOriginal() {
++        val apps = listOf(
++            app("Zed", 0).copy(packageName = "com.test.map"),
++            app("Road Map", 1),
++            app("Maps", 2),
++            app("MAP", 3),
++            app("map", 4),
++            app("Maple", 5),
++            app("Unrelated", 6),
++        )
++        val index = AppSearchEngine.prepare(apps)
++        assertEquals(listOf(apps[3], apps[4], apps[5], apps[2], apps[1], apps[0]), index.search(" MAP "))
++        assertEquals(originalSearch(apps, "map"), index.search("map"))
++    }
++
++    @Test
++    fun aliasCopiesRebuildCachedFields() {
++        val original = app("Old Name", 1)
++        val renamed = original.copy(label = "新名称")
++        val index = AppSearchEngine.prepare(listOf(renamed))
++        assertEquals(emptyList<InstalledApp>(), index.search("Old Name"))
++        assertEquals(listOf(renamed), index.search("新名"))
++        assertEquals(original.componentKey, renamed.componentKey)
++        assertEquals("com.changed/Changed", renamed.copy(packageName = "com.changed", activityName = "Changed").componentKey)
++    }
++
++    @Test
++    fun multilingualAndPackageMatchesAreUnchanged() {
++        val apps = listOf("地图", "高德地图", "相机", "İstanbul", "Straße", "ΣΟΣ", "😀 Tools", "café")
++            .mapIndexed { i, label -> app(label, i) }
++        val index = AppSearchEngine.prepare(apps)
++        for (query in listOf("图", " 地图 ", "İ", "i", "ß", "σ", "😀", "é", "COM.TEST", "absent")) {
++            assertEquals("Query: $query", originalSearch(apps, query), index.search(query))
++        }
++    }
++
++    @Test
++    fun randomizedCatalogsMatchOriginalAlgorithm() {
++        val random = Random(20260929)
++        val tokens = listOf("Map", "MAP", "map", "地图", "a", "Z", "İ", "ß", "😀", " ")
++        repeat(100) {
++            val apps = List(random.nextInt(0, 400)) { i ->
++                app(List(random.nextInt(1, 5)) { tokens[random.nextInt(tokens.size)] }.joinToString(""), i)
++                    .copy(packageName = "com.test.${tokens[random.nextInt(tokens.size)]}.$i")
++            }.shuffled(random)
++            val index = AppSearchEngine.prepare(apps)
++            repeat(30) {
++                val query = if (random.nextBoolean()) tokens[random.nextInt(tokens.size)] else "com.test"
++                assertEquals(originalSearch(apps, query), index.search(query))
++            }
++        }
++    }
++
++    private fun app(label: String, id: Int) = InstalledApp(label, "com.test.app$id", "Activity$id")
++
++    // The source archive's original algorithm, kept as the compatibility oracle.
++    private fun originalSearch(apps: List<InstalledApp>, query: String): List<InstalledApp> {
++        val trimmed = query.trim()
++        if (trimmed.isEmpty()) return apps
++        val needle = trimmed.lowercase()
++        return apps.mapNotNull { app ->
++            val label = app.label.lowercase()
++            val score = when {
++                label == needle -> 4
++                label.startsWith(needle) -> 3
++                label.contains(needle) -> 2
++                app.packageName.lowercase().contains(needle) -> 1
++                else -> -1
++            }
++            if (score < 0) null else app to score
++        }.sortedWith(compareByDescending<Pair<InstalledApp, Int>> { it.second }
++            .thenBy { it.first.label.lowercase() }).map { it.first }
++    }
++}
