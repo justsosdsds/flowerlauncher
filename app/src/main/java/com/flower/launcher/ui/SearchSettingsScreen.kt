@@ -29,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContactPage
@@ -85,6 +86,7 @@ private sealed interface SearchSettingsPage {
     data object Targets : SearchSettingsPage
     data object Interaction : SearchSettingsPage
     data object Appearance : SearchSettingsPage
+    data object Blacklist : SearchSettingsPage
     data object AddTarget : SearchSettingsPage
     data object AddGroup : SearchSettingsPage
     data class EditTarget(val id: String) : SearchSettingsPage
@@ -102,6 +104,8 @@ fun SearchSettingsScreen(
     onChange: (SearchPreferences) -> Unit,
     onTargetsChange: (List<SearchTarget>) -> Unit,
     onGroupsChange: (List<SearchTargetGroup>) -> Unit,
+    blockedComponentKeys: Set<String> = emptySet(),
+    onSetAppBlocked: (InstalledApp, Boolean) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     var page by remember { mutableStateOf<SearchSettingsPage>(SearchSettingsPage.Root) }
@@ -130,6 +134,7 @@ fun SearchSettingsScreen(
             SearchSettingsPage.Targets -> SearchSettingsPage.Root
             SearchSettingsPage.Interaction -> SearchSettingsPage.Root
             SearchSettingsPage.Appearance -> SearchSettingsPage.Root
+            SearchSettingsPage.Blacklist -> SearchSettingsPage.Root
             SearchSettingsPage.AddTarget -> SearchSettingsPage.Targets
             SearchSettingsPage.AddGroup -> SearchSettingsPage.Targets
             is SearchSettingsPage.EditTarget -> SearchSettingsPage.Targets
@@ -148,7 +153,17 @@ fun SearchSettingsScreen(
             onOpenTargets = { page = SearchSettingsPage.Targets },
             onOpenInteraction = { page = SearchSettingsPage.Interaction },
             onOpenAppearance = { page = SearchSettingsPage.Appearance },
+            onOpenBlacklist = { page = SearchSettingsPage.Blacklist },
+            blockedAppCount = blockedComponentKeys.size,
             onBack = onBack,
+            modifier = modifier,
+        )
+
+        SearchSettingsPage.Blacklist -> BlacklistPage(
+            apps = apps,
+            blockedComponentKeys = blockedComponentKeys,
+            onSetAppBlocked = onSetAppBlocked,
+            onBack = { page = SearchSettingsPage.Root },
             modifier = modifier,
         )
 
@@ -279,6 +294,8 @@ private fun SearchSettingsRoot(
     onOpenTargets: () -> Unit,
     onOpenInteraction: () -> Unit,
     onOpenAppearance: () -> Unit,
+    onOpenBlacklist: () -> Unit,
+    blockedAppCount: Int,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -306,6 +323,18 @@ private fun SearchSettingsRoot(
             title = "搜索目标",
             subtitle = targets.filter { it.enabled }.joinToString("、") { it.label }.ifBlank { "无" },
             onClick = onOpenTargets,
+            trailing = { Icon(Icons.Default.ChevronRight, contentDescription = null, tint = OnHomeSecondary) },
+        )
+
+        SettingRow(
+            icon = Icons.Default.Block,
+            title = "应用黑名单",
+            subtitle = if (blockedAppCount == 0) {
+                "黑名单中的应用不会出现在搜索和应用抽屉"
+            } else {
+                "$blockedAppCount 个应用不会出现在搜索和应用抽屉"
+            },
+            onClick = onOpenBlacklist,
             trailing = { Icon(Icons.Default.ChevronRight, contentDescription = null, tint = OnHomeSecondary) },
         )
 
@@ -652,6 +681,92 @@ private fun SearchBarColorPicker(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BlacklistPage(
+    apps: List<InstalledApp>,
+    blockedComponentKeys: Set<String>,
+    onSetAppBlocked: (InstalledApp, Boolean) -> Unit,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var filter by remember { mutableStateOf("") }
+    val sortedApps = remember(apps) { apps.sortedBy { it.label.lowercase() } }
+    val filtered = remember(sortedApps, filter) {
+        val needle = filter.trim().lowercase()
+        if (needle.isEmpty()) {
+            sortedApps
+        } else {
+            sortedApps.filter {
+                it.label.lowercase().contains(needle) || it.packageName.lowercase().contains(needle)
+            }
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFF232428))
+            .statusBarsPadding()
+            .navigationBarsPadding(),
+    ) {
+        SettingsHeader(title = "应用黑名单", onBack = onBack)
+        Divider(color = Color.White.copy(alpha = 0.10f))
+
+        Text(
+            text = "黑名单中的应用不会出现在搜索结果和应用抽屉中。",
+            color = OnHomeSecondary,
+            fontSize = 13.sp,
+            lineHeight = 19.sp,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+        )
+
+        OutlinedTextField(
+            value = filter,
+            onValueChange = { filter = it },
+            label = { Text("搜索应用") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
+        )
+
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            items(filtered, key = { it.componentKey }) { app ->
+                val blocked = app.componentKey in blockedComponentKeys
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSetAppBlocked(app, !blocked) }
+                        .padding(horizontal = 24.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val icon = app.icon
+                    if (icon != null) {
+                        Image(
+                            bitmap = icon,
+                            contentDescription = null,
+                            modifier = Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)),
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .background(Color(0xFF34353A), RoundedCornerShape(10.dp)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(app.label.take(1), color = OnHomePrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Column(Modifier.weight(1f).padding(start = 16.dp)) {
+                        Text(app.label, color = OnHomePrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                        Text(app.packageName, color = OnHomeSecondary, fontSize = 12.sp)
+                    }
+                    Switch(checked = blocked, onCheckedChange = { onSetAppBlocked(app, it) })
+                }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
     }
 }

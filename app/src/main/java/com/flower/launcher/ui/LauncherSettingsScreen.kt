@@ -140,6 +140,8 @@ fun LauncherSettingsScreen(
     onSearchTargetsChange: (List<SearchTarget>) -> Unit,
     searchGroups: List<SearchTargetGroup> = emptyList(),
     onSearchGroupsChange: (List<SearchTargetGroup>) -> Unit = {},
+    blockedComponentKeys: Set<String> = emptySet(),
+    onSetAppBlocked: (InstalledApp, Boolean) -> Unit = { _, _ -> },
     onSetAppHidden: (InstalledApp, Boolean) -> Unit,
     onOpenWallpaper: () -> Unit,
     onAddFolder: () -> Unit,
@@ -180,6 +182,8 @@ fun LauncherSettingsScreen(
             onChange = onSearchChange,
             onTargetsChange = onSearchTargetsChange,
             onGroupsChange = onSearchGroupsChange,
+            blockedComponentKeys = blockedComponentKeys,
+            onSetAppBlocked = onSetAppBlocked,
             modifier = modifier,
         )
         return

@@ -244,6 +244,14 @@ fun LauncherRoot(
         )
     }
 
+    fun setAppBlocked(app: InstalledApp, blocked: Boolean) {
+        appCustomizations = appCustomizationRepository.setBlocked(
+            current = appCustomizations,
+            componentKey = app.componentKey,
+            blocked = blocked,
+        )
+    }
+
     fun renameApp(app: InstalledApp, newName: String?) {
         appCustomizations = appCustomizationRepository.setAlias(
             current = appCustomizations,
@@ -316,13 +324,22 @@ fun LauncherRoot(
             if (alias.isNullOrBlank()) app else app.copy(label = alias)
         }
     }
-    val visibleApps = remember(customizedApps, appCustomizations.hiddenComponentKeys) {
-        customizedApps.filterNot { it.componentKey in appCustomizations.hiddenComponentKeys }
+    val blockedComponentKeys = appCustomizations.blockedComponentKeys
+    val visibleApps = remember(customizedApps, appCustomizations.hiddenComponentKeys, blockedComponentKeys) {
+        customizedApps.filterNot {
+            it.componentKey in appCustomizations.hiddenComponentKeys || it.componentKey in blockedComponentKeys
+        }
     }
-    val hiddenDrawerApps = remember(customizedApps, appCustomizations.hiddenComponentKeys) {
-        customizedApps.filter { it.componentKey in appCustomizations.hiddenComponentKeys }
+    val hiddenDrawerApps = remember(customizedApps, appCustomizations.hiddenComponentKeys, blockedComponentKeys) {
+        customizedApps.filter {
+            it.componentKey in appCustomizations.hiddenComponentKeys && it.componentKey !in blockedComponentKeys
+        }
     }
-    val searchApps = if (searchPreferences.showHiddenApps) customizedApps else visibleApps
+    val searchApps = if (searchPreferences.showHiddenApps) {
+        customizedApps.filterNot { it.componentKey in blockedComponentKeys }
+    } else {
+        visibleApps
+    }
     // Keep prepared order/index data alive while the drawer itself is uncomposed.
     val visibleDrawerCatalog = remember(visibleApps) { AppDrawerCatalog(visibleApps) }
     val hiddenDrawerCatalog = remember(hiddenDrawerApps) { AppDrawerCatalog(hiddenDrawerApps) }
@@ -1371,6 +1388,8 @@ fun LauncherRoot(
                     onChange = ::updateSearchPreferences,
                     onTargetsChange = ::updateSearchTargets,
                     onGroupsChange = ::updateSearchGroups,
+                    blockedComponentKeys = appCustomizations.blockedComponentKeys,
+                    onSetAppBlocked = ::setAppBlocked,
                     modifier = Modifier.fillMaxSize().zIndex(SETTINGS_OVERLAY_Z),
                 )
             }
@@ -1388,6 +1407,8 @@ fun LauncherRoot(
                     onSearchTargetsChange = ::updateSearchTargets,
                     searchGroups = searchGroups,
                     onSearchGroupsChange = ::updateSearchGroups,
+                    blockedComponentKeys = appCustomizations.blockedComponentKeys,
+                    onSetAppBlocked = ::setAppBlocked,
                     initialSection = launcherSettingsInitialSection,
                     onClose = {
                         showLauncherSettings = false
