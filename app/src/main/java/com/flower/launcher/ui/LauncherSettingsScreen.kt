@@ -245,28 +245,17 @@ private fun SettingsHome(onOpenSection: (LauncherSettingsSection) -> Unit) {
     SettingsNavRow(Icons.Default.Wallpaper, "壁纸", "视差、滚动、随机壁纸与调色板") { onOpenSection(LauncherSettingsSection.Wallpaper) }
     SettingsNavRow(Icons.Default.Palette, "全局外观", "主题颜色、动画、深色模式、字体和图标") { onOpenSection(LauncherSettingsSection.Appearance) }
     SettingsNavRow(Icons.Default.Gesture, "手势与热键", "双击、单指、双指、热键和屏幕锁定") { onOpenSection(LauncherSettingsSection.Gestures) }
-    SettingsNavRow(Icons.Default.Backup, "备份与还原", "备份、恢复、备份目录和自动备份") { onOpenSection(LauncherSettingsSection.Backup) }
 
     SettingsSectionLabel("页面")
     SettingsNavRow(Icons.Default.Home, "主页", "图标外观、网格、Dock 和高级设置") { onOpenSection(LauncherSettingsSection.Home) }
     SettingsNavRow(Icons.Default.Apps, "应用页面", "文件夹、图标、网格、分类、排序") { onOpenSection(LauncherSettingsSection.Apps) }
     SettingsNavRow(Icons.Default.Search, "搜索页面", "搜索提供者、启动页和搜索结果") { onOpenSection(LauncherSettingsSection.Search) }
-    SettingsNavRow(Icons.Default.Settings, "Your Feed", "RSS、来源、阅读样式和刷新") { onOpenSection(LauncherSettingsSection.Feed) }
-    SettingsNavRow(Icons.Default.Settings, "Web 页面", "网页面板 URL") { onOpenSection(LauncherSettingsSection.WebPanel) }
-    SettingsNavRow(Icons.Default.Settings, "Google / Discover 面板", "Google 面板主题") { onOpenSection(LauncherSettingsSection.GooglePanel) }
     SettingsNavRow(Icons.Default.Settings, "页面管理", "增删、排序 panel 与页面、预设") { onOpenSection(LauncherSettingsSection.PageManager) }
 
     SettingsSectionLabel("其他")
-    SettingsNavRow(Icons.Default.Notifications, "通知", "主页/应用页通知、徽标、颜色和形状") { onOpenSection(LauncherSettingsSection.Notifications) }
     SettingsNavRow(Icons.Default.Folder, "文件夹", "沉浸式、颜色、列数、图标和标签") { onOpenSection(LauncherSettingsSection.Folders) }
     SettingsNavRow(Icons.Default.Widgets, "小部件", "主题、圆角和字体") { onOpenSection(LauncherSettingsSection.Widgets) }
     SettingsNavRow(Icons.Default.Lock, "安全与隐私", "PIN、指纹、隐藏应用、数据分享") { onOpenSection(LauncherSettingsSection.Security) }
-    SettingsNavRow(Icons.Default.ScreenRotation, "屏幕", "方向、沉浸模式、灰度、状态栏") { onOpenSection(LauncherSettingsSection.Screen) }
-    SettingsNavRow(Icons.Default.ScreenRotation, "多显示设置", "复制主屏、独立配置、统一配置") { onOpenSection(LauncherSettingsSection.MultiDisplay) }
-    SettingsNavRow(Icons.Default.Settings, "故障排除", "重启、重置、FAQ、报告问题、社区") { onOpenSection(LauncherSettingsSection.Troubleshooting) }
-    SettingsNavRow(Icons.Default.Settings, "实验选项", "用户界面、高级、壁纸、SL7 Preview") { onOpenSection(LauncherSettingsSection.Experimental) }
-    SettingsNavRow(Icons.Default.Settings, "开发者选项", "调试、开发者小部件、日志") { onOpenSection(LauncherSettingsSection.Developer) }
-    SettingsNavRow(Icons.Default.Settings, "Premium 功能", "Smart Widgets、模糊、双指手势等") { onOpenSection(LauncherSettingsSection.Premium) }
     SettingsNavRow(Icons.Default.Info, "版本信息", "版本、设备、许可、致谢和系统快捷项") { onOpenSection(LauncherSettingsSection.About) }
 }
 
@@ -277,27 +266,9 @@ private fun HomeSettingsPage(
     onOpenSection: (LauncherSettingsSection, LauncherSettingsSection?) -> Unit,
 ) {
     SettingsSectionLabel("主页")
-    SettingsNavRow(Icons.Default.Palette, "图标外观", "图标包、自适应图标、形状、双击和文件夹图标") { onOpenSection(LauncherSettingsSection.HomeIconAppearance, LauncherSettingsSection.Home) }
-    SettingsNavRow(Icons.Default.Settings, "网格属性", "列、行、图标大小、标签、内边距、旋转") { onOpenSection(LauncherSettingsSection.HomeGrid, LauncherSettingsSection.Home) }
-    SettingsNavRow(Icons.Default.Settings, "Dock", "行列、图标大小、页面、背景、边到边、无限滚动") { onOpenSection(LauncherSettingsSection.Dock, LauncherSettingsSection.Home) }
-
-    SettingsSectionLabel("FlowerLauncher 当前可用")
     ToggleSetting("显示时钟", "在主页顶部显示日期和时间", preferences.showClock) { onChange(preferences.copy(showClock = it)) }
     SettingsNavRow(Icons.Default.Settings, "时钟", "字体、颜色与位置") { onOpenSection(LauncherSettingsSection.Clock, LauncherSettingsSection.Home) }
     ToggleSetting("锁定桌面布局", "锁定后禁止从长按菜单添加内容", preferences.layoutLocked) { onChange(preferences.copy(layoutLocked = it)) }
-
-    SettingsSectionLabel("主页设置树")
-    CatalogRows(
-        listOf(
-            CatalogItem("页面指示器", "开关 · 默认开启"),
-            CatalogItem("新应用自动加入主页", "开关 · 默认关闭"),
-            CatalogItem("反转页顺序", "高级 · 开关 · 默认关闭"),
-            CatalogItem("提升可读性", "高级 · 开关 · 默认关闭"),
-            CatalogItem("次级页面变暗", "高级 · 开关 · 默认关闭"),
-            CatalogItem("底部按钮", "高级 · 开关 · 默认关闭"),
-            CatalogItem("页面无限滚动", "开关 · 默认关闭"),
-        )
-    )
 }
 
 @Composable
@@ -428,21 +399,6 @@ private fun AppsSettingsPage(
     SettingsNavRow(Icons.Default.Settings, "网格属性", "列数、图标大小、垂直间距、标签") {
         onOpenSection(LauncherSettingsSection.DrawerGrid, LauncherSettingsSection.Apps)
     }
-    SettingsTextRow("启动视图", "所有应用")
-
-    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-    CatalogRows(listOf(CatalogItem("启用自动应用排序", "您的应用将始终井然有序且易于查找")))
-
-    SettingsSectionLabel("高级设置")
-    CatalogRows(
-        listOf(
-            CatalogItem("隐藏 Play 商店图标", "待接功能"),
-            CatalogItem("隐藏未使用的应用图标", "待接功能"),
-            CatalogItem("应用程序由底部堆起", "待接功能"),
-            CatalogItem("应用启动后关闭应用页面", "当前行为：开启"),
-            CatalogItem("保留上一次位置", "待接功能"),
-        )
-    )
 }
 
 @Composable
@@ -514,10 +470,6 @@ private fun DrawerIconAppearanceSettingsPage(
             onChange(preferences.copy(drawerIconShape = value - 1))
         }
     }
-
-    SettingsNavRow(Icons.Default.Folder, "文件夹图标", "布局、背景、预览样式与背景颜色") {
-        onOpenSection(LauncherSettingsSection.FolderIcons, LauncherSettingsSection.DrawerIconAppearance)
-    }
 }
 
 @Composable
@@ -526,11 +478,6 @@ private fun GesturesSettingsPage(
     onChange: (LauncherPreferences) -> Unit,
     onOpenSection: (LauncherSettingsSection, LauncherSettingsSection?) -> Unit,
 ) {
-    SettingsSectionLabel("基础")
-    CatalogRows(listOf(CatalogItem("双击", "动作 · 默认无")))
-    SettingsNavRow(Icons.Default.Settings, "热键", "前台按主页 / 主页双击 / 长按返回") { onOpenSection(LauncherSettingsSection.HotKeys, LauncherSettingsSection.Gestures) }
-    SettingsNavRow(Icons.Default.Settings, "Smart Display Off", "PRO") { onOpenSection(LauncherSettingsSection.SmartDisplay, LauncherSettingsSection.Gestures) }
-
     SettingsSectionLabel("滑动手势")
     ToggleSetting("启用滑动手势", "控制主页与搜索页的滑动手势", preferences.enableSwipeGestures) { onChange(preferences.copy(enableSwipeGestures = it)) }
     ToggleSetting("手势震动", "完成手势时提供轻微震动反馈", preferences.vibrationOnGesture, enabled = preferences.enableSwipeGestures) { onChange(preferences.copy(vibrationOnGesture = it)) }
@@ -611,10 +558,6 @@ private fun GesturesSettingsPage(
             Text("恢复默认灵敏度")
         }
     }
-
-    SettingsNavRow(Icons.Default.Gesture, "单指", "左 / 右 / 上 / 下") { onOpenSection(LauncherSettingsSection.SingleFinger, LauncherSettingsSection.Gestures) }
-    SettingsNavRow(Icons.Default.Gesture, "双指", "双指滑动、捏合、张开、旋转 · PRO") { onOpenSection(LauncherSettingsSection.DoubleFinger, LauncherSettingsSection.Gestures) }
-    CatalogRows(listOf(CatalogItem("屏幕锁定方式", "仅 Android < 28 时显示")))
 }
 
 @Composable
@@ -623,9 +566,6 @@ private fun AppearanceSettingsPage(
     onChange: (LauncherPreferences) -> Unit,
     onOpenSection: (LauncherSettingsSection, LauncherSettingsSection?) -> Unit,
 ) {
-    SettingsSectionLabel("全局外观")
-    SettingsNavRow(Icons.Default.Palette, "修改主题颜色", "Accent / Background / Surface / Stroke / 玻璃参数") { onOpenSection(LauncherSettingsSection.EditThemeColors, LauncherSettingsSection.Appearance) }
-    CatalogRows(listOf(CatalogItem("主页动画", "枚举 / 下拉"), CatalogItem("应用启动动画", "枚举 / 下拉")))
     SettingsSectionLabel("搜索切换动画")
     StepperSetting("回弹时间", preferences.searchReboundDurationMs, 160, 600, step = 20, suffix = " ms") {
         onChange(preferences.copy(searchReboundDurationMs = it))
@@ -635,9 +575,6 @@ private fun AppearanceSettingsPage(
     StepperSetting("主页背景压暗", preferences.homeBackgroundDimPercent, 0, 50, step = 5, suffix = "%", enabled = preferences.blurEnabled) {
         onChange(preferences.copy(homeBackgroundDimPercent = it))
     }
-    SettingsNavRow(Icons.Default.Settings, "深色模式", "激活条件与 AMOLED 黑") { onOpenSection(LauncherSettingsSection.DarkMode, LauncherSettingsSection.Appearance) }
-    SettingsNavRow(Icons.Default.Settings, "字体", "标题字体、正文字体、系统字体、预置字体") { onOpenSection(LauncherSettingsSection.FontPicker, LauncherSettingsSection.Appearance) }
-    SettingsNavRow(Icons.Default.Palette, "主页图标外观", "主页图标包和形状") { onOpenSection(LauncherSettingsSection.HomeIconAppearance, LauncherSettingsSection.Appearance) }
     SettingsNavRow(Icons.Default.Palette, "应用页图标外观", "抽屉独立外观") { onOpenSection(LauncherSettingsSection.DrawerIconAppearance, LauncherSettingsSection.Appearance) }
     SettingsSectionLabel("界面缩放")
     StepperSetting("缩放比例", preferences.uiScalePercent, 70, 110, step = 5, suffix = "%") {
@@ -667,37 +604,23 @@ private fun IconAppearanceSettingsPage(home: Boolean, onOpenSection: (LauncherSe
 private fun WallpaperSettingsPage(onOpenWallpaper: () -> Unit) {
     SettingsSectionLabel("壁纸")
     Button(onClick = onOpenWallpaper, modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp)) { Text("选择壁纸") }
-    CatalogRows(wallpaperCatalog())
 }
 
 @Composable
 private fun FolderSettingsPage(onAddFolder: () -> Unit, onOpenSection: (LauncherSettingsSection, LauncherSettingsSection?) -> Unit) {
     SettingsSectionLabel("文件夹")
     Button(onClick = onAddFolder, modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp)) { Text("添加文件夹") }
-    CatalogRows(folderCatalog())
-    SettingsNavRow(Icons.Default.Folder, "文件夹图标", "文件夹图标与预览样式") { onOpenSection(LauncherSettingsSection.FolderIcons, LauncherSettingsSection.Folders) }
 }
 
 @Composable
 private fun WidgetSettingsPage(onAddWidget: () -> Unit) {
     SettingsSectionLabel("小部件")
     Button(onClick = onAddWidget, modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp)) { Text("添加小部件") }
-    CatalogRows(widgetCatalog())
 }
 
 @Composable
 private fun SecuritySettingsPage(onOpenSection: (LauncherSettingsSection, LauncherSettingsSection?) -> Unit) {
     SettingsSectionLabel("安全与隐私")
-    CatalogRows(
-        listOf(
-            CatalogItem("安全 PIN", "子页面 / 文本 · 默认 0000"),
-            CatalogItem("允许指纹", "开关 · 默认关闭"),
-            CatalogItem("保护隐藏应用", "开关 · 默认关闭"),
-            CatalogItem("保护主页更改", "开关 · PRO · 默认关闭"),
-            CatalogItem("分享使用数据 / Analytics", "开关 · 默认开启"),
-            CatalogItem("自动错误报告", "开关 · 默认开启"),
-        )
-    )
     SettingsNavRow(Icons.Default.Lock, "管理隐藏应用", "应用列表 + 搜索 + 隐藏 / 显示") { onOpenSection(LauncherSettingsSection.HiddenApps, LauncherSettingsSection.Security) }
 }
 
@@ -765,21 +688,6 @@ private fun AboutSettingsPage() {
     SettingsSectionLabel("FlowerLauncher")
     SettingsTextRow("版本", version)
     SettingsTextRow("包名", context.packageName)
-    SettingsSectionLabel("信息")
-    CatalogRows(
-        listOf(
-            CatalogItem("Android 版本 / 设备信息"),
-            CatalogItem("开源许可 Licenses"),
-            CatalogItem("致谢"),
-            CatalogItem("社媒"),
-            CatalogItem("隐私政策"),
-            CatalogItem("Wi‑Fi 设置快捷项"),
-            CatalogItem("蓝牙设置快捷项"),
-            CatalogItem("显示设置快捷项"),
-            CatalogItem("通知设置快捷项"),
-            CatalogItem("电池设置快捷项"),
-        )
-    )
     Text("设置结构依据 Smart Launcher 6 反编译设置树重建；FlowerLauncher 使用自己的代码与数据模型。", color = OnHomeSecondary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp))
 }
 

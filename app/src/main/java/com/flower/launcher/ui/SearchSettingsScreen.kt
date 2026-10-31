@@ -340,12 +340,6 @@ private fun SearchSettingsRoot(
 
         SectionTitle("搜索启动页")
         StepperRow(
-            title = "通讯",
-            value = preferences.launchContactsCount,
-            onMinus = { onChange(preferences.copy(launchContactsCount = (preferences.launchContactsCount - 1).coerceAtLeast(0))) },
-            onPlus = { onChange(preferences.copy(launchContactsCount = (preferences.launchContactsCount + 1).coerceAtMost(8))) },
-        )
-        StepperRow(
             title = "应用",
             value = preferences.launchAppsCount,
             onMinus = { onChange(preferences.copy(launchAppsCount = (preferences.launchAppsCount - 1).coerceAtLeast(0))) },
@@ -369,24 +363,6 @@ private fun SearchSettingsRoot(
         )
 
         SectionTitle("搜索结果")
-        ToggleRow(Icons.Default.ContactPage, "通讯", "在你通讯簿中查找联系人", preferences.contactsEnabled) {
-            onChange(preferences.copy(contactsEnabled = it))
-        }
-        ToggleRow(Icons.Default.Shortcut, "快捷方式", null, preferences.shortcutsEnabled) {
-            onChange(preferences.copy(shortcutsEnabled = it))
-        }
-        SettingRow(
-            icon = Icons.Default.Search,
-            title = "网页建议",
-            subtitle = "Smart Launcher 默认开启；FlowerLauncher 功能待接",
-            trailing = { Text("待实现", color = OnHomeSecondary, fontSize = 12.sp) },
-        )
-        ToggleRow(Icons.Default.FolderOpen, "媒体", "查找设备上的文件", preferences.mediaEnabled) {
-            onChange(preferences.copy(mediaEnabled = it))
-        }
-        ToggleRow(Icons.Default.CalendarMonth, "日历", "查找日历中的事件", preferences.calendarEnabled) {
-            onChange(preferences.copy(calendarEnabled = it))
-        }
         ToggleRow(Icons.Default.Settings, "设置", null, preferences.settingsEnabled) {
             onChange(preferences.copy(settingsEnabled = it))
         }
