@@ -46,6 +46,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
@@ -115,6 +116,7 @@ import androidx.compose.ui.unit.sp
 import com.flower.launcher.apps.AppSearchEngine
 import com.flower.launcher.apps.InstalledApp
 import com.flower.launcher.search.SearchPreferences
+import com.flower.launcher.search.ShepherdHabitShortcut
 import com.flower.launcher.search.SearchTarget
 import com.flower.launcher.search.SearchTargetGroup
 import com.flower.launcher.search.layoutSearchTargets
@@ -151,6 +153,7 @@ fun SearchContent(
     expandedGroupIds: Set<String> = emptySet(),
     onToggleGroup: (String) -> Unit = {},
     onSearchTarget: (SearchTarget, String) -> Unit,
+    onOpenShepherdHabits: () -> Unit,
     onOpenSystemSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -271,6 +274,9 @@ fun SearchContent(
     val appsByPackage = remember(apps) {
         buildMap { apps.forEach { app -> if (app.packageName !in this) put(app.packageName, app) } }
     }
+    val showShepherdHabitShortcut = prefixMatch == null &&
+        ShepherdHabitShortcut.matches(trimmedQuery) &&
+        appsByPackage.containsKey(ShepherdHabitShortcut.PACKAGE_NAME)
 
     // Strictly serialize IME commands. The coordinator advances Hidden -> Showing before
     // Show and Visible -> Hiding before Hide. If the desired target reverses while a command
@@ -538,6 +544,17 @@ fun SearchContent(
                     )
                 }
             } else {
+                if (showShepherdHabitShortcut) {
+                    SectionLabel("快捷打开")
+                    SearchActionRow(
+                        icon = if (appsByPackage[ShepherdHabitShortcut.PACKAGE_NAME]?.icon == null) {
+                            Icons.Default.CheckCircle
+                        } else null,
+                        bitmap = appsByPackage[ShepherdHabitShortcut.PACKAGE_NAME]?.icon,
+                        text = "Shepherd · 习惯",
+                        onClick = onOpenShepherdHabits,
+                    )
+                }
                 if (results.isNotEmpty()) {
                     SectionLabel("所有应用")
                     AppGrid(
@@ -551,7 +568,7 @@ fun SearchContent(
                         onOpenAppStore = onOpenAppStore,
                         onUninstallApp = onUninstallApp,
                     )
-                } else {
+                } else if (!showShepherdHabitShortcut) {
                     Text(
                         text = "没有匹配的应用",
                         color = OnHomeSecondary.copy(alpha = 0.65f),
@@ -682,6 +699,10 @@ fun SearchContent(
                                 focusManager.clearFocus()
                                 onSearchTarget(matched.target, effectiveQuery)
                             }
+                        } else if (showShepherdHabitShortcut) {
+                            coordinator.dispatch(SearchIntent.EnterExpandedMode)
+                            focusManager.clearFocus()
+                            onOpenShepherdHabits()
                         } else {
                             val bestMatch = results.firstOrNull()
                             if (trimmedQuery.isNotEmpty() && bestMatch != null) {

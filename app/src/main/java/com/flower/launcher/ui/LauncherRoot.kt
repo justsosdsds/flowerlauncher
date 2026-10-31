@@ -60,6 +60,7 @@ import com.flower.launcher.home.visitHomePage
 import com.flower.launcher.home.HomePreferences
 import com.flower.launcher.search.SearchTarget
 import com.flower.launcher.search.SearchTargetGroup
+import com.flower.launcher.search.ShepherdHabitShortcut
 import com.flower.launcher.settings.LauncherPreferences
 import com.flower.launcher.ui.theme.SearchScrim
 import kotlinx.coroutines.Job
@@ -262,6 +263,18 @@ fun LauncherRoot(
 
     fun launchIntent(intent: Intent) {
         runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+
+    fun openShepherdHabits() {
+        // Package-scoped VIEW prevents an unrelated app from intercepting this shortcut.
+        // CLEAR_TOP + SINGLE_TOP reuse an existing Shepherd MainActivity when possible.
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(ShepherdHabitShortcut.DEEP_LINK_URI)).apply {
+            setPackage(ShepherdHabitShortcut.PACKAGE_NAME)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        if (runCatching { context.startActivity(intent) }.isFailure) {
+            Toast.makeText(context, "请安装或更新 Shepherd 以打开习惯页", Toast.LENGTH_SHORT).show()
+        }
     }
 
     fun searchWithTarget(target: SearchTarget, query: String) {
@@ -1275,6 +1288,10 @@ fun LauncherRoot(
                     expandedGroupIds = expandedSearchGroups,
                     onToggleGroup = ::toggleSearchGroup,
                     onSearchTarget = ::searchWithTarget,
+                    onOpenShepherdHabits = {
+                        scope.launch { verticalTransition.reset() }
+                        openShepherdHabits()
+                    },
                     onOpenSystemSettings = { launchIntent(Intent(Settings.ACTION_SETTINGS)) },
                 )
             }
