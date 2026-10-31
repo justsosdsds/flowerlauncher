@@ -433,7 +433,7 @@ private fun DrawerAppTile(
     }
 }
 
-private fun drawerIconShape(preferences: LauncherPreferences): Shape {
+internal fun drawerIconShape(preferences: LauncherPreferences): Shape {
     if (!preferences.drawerUseCustomIconAppearance) return RoundedCornerShape(18.dp)
     if (!preferences.drawerAdaptiveIcons) return RoundedCornerShape(18.dp)
     return when (preferences.drawerIconShape) {

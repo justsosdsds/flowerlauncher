@@ -40,6 +40,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
@@ -311,19 +312,24 @@ internal fun IconOrFallback(
     app: InstalledApp,
     size: Dp,
     fallbackFontSize: TextUnit,
+    shape: Shape? = null,
+    fallbackBackground: Color? = null,
 ) {
     val icon = app.icon
     if (icon != null) {
         Image(
             bitmap = icon,
             contentDescription = app.label,
-            modifier = Modifier.size(size),
+            modifier = Modifier
+                .size(size)
+                .then(if (shape != null) Modifier.clip(shape) else Modifier),
         )
     } else {
         Box(
             modifier = Modifier
                 .size(size)
-                .clip(RoundedCornerShape(14.dp)),
+                .clip(shape ?: RoundedCornerShape(14.dp))
+                .then(if (fallbackBackground != null) Modifier.background(fallbackBackground) else Modifier),
             contentAlignment = Alignment.Center,
         ) {
             Text(

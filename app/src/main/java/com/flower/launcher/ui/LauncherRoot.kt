@@ -1247,6 +1247,7 @@ fun LauncherRoot(
                     apps = searchApps,
                     hiddenComponentKeys = appCustomizations.hiddenComponentKeys,
                     preferences = searchPreferences,
+                    launcherPreferences = launcherPreferences,
                     imePresentationReady = searchImePresentationReady,
                     imeControlEnabled = !showSearchSettings,
                     coordinator = searchCoordinator,

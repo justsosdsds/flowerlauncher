@@ -87,6 +87,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -122,6 +123,7 @@ import com.flower.launcher.search.SearchTargetGroup
 import com.flower.launcher.search.layoutSearchTargets
 import com.flower.launcher.search.matchSearchTargetPrefix
 import com.flower.launcher.search.searchPrefixSuggestions
+import com.flower.launcher.settings.LauncherPreferences
 import com.flower.launcher.ui.theme.LauncherAccentLight
 import com.flower.launcher.ui.theme.OnHomePrimary
 import com.flower.launcher.ui.theme.OnHomeSecondary
@@ -133,6 +135,7 @@ fun SearchContent(
     apps: List<InstalledApp>,
     hiddenComponentKeys: Set<String>,
     preferences: SearchPreferences,
+    launcherPreferences: LauncherPreferences,
     imePresentationReady: Boolean,
     imeControlEnabled: Boolean = true,
     coordinator: SearchCoordinator,
@@ -277,6 +280,15 @@ fun SearchContent(
     val showShepherdHabitShortcut = prefixMatch == null &&
         ShepherdHabitShortcut.matches(trimmedQuery) &&
         appsByPackage.containsKey(ShepherdHabitShortcut.PACKAGE_NAME)
+
+    // Search result tiles mirror the app drawer's icon appearance and grid metrics.
+    val drawerColumns = launcherPreferences.drawerColumns.coerceIn(3, 7)
+    val drawerIconSizeDp = launcherPreferences.drawerIconSizeDp
+    val drawerIconShape = drawerIconShape(launcherPreferences)
+    val drawerShowLabels = launcherPreferences.drawerShowLabels
+    val drawerLabelSizeSp = launcherPreferences.drawerLabelSizeSp
+    val drawerAllowLabelWrap = launcherPreferences.drawerAllowLabelWrap
+    val drawerVerticalSpacingDp = launcherPreferences.drawerVerticalSpacingDp
 
     // Strictly serialize IME commands. The coordinator advances Hidden -> Showing before
     // Show and Visible -> Hiding before Hide. If the desired target reverses while a command
@@ -534,6 +546,13 @@ fun SearchContent(
                     AppGrid(
                         apps = launchApps,
                         hiddenComponentKeys = hiddenComponentKeys,
+                        columns = drawerColumns,
+                        iconSizeDp = drawerIconSizeDp,
+                        iconShape = drawerIconShape,
+                        showLabels = drawerShowLabels,
+                        labelSizeSp = drawerLabelSizeSp,
+                        allowLabelWrap = drawerAllowLabelWrap,
+                        verticalSpacingDp = drawerVerticalSpacingDp,
                         onAppSelected = onAppSelected,
                         onShareApp = onShareApp,
                         onAppInfo = onAppInfo,
@@ -560,6 +579,13 @@ fun SearchContent(
                     AppGrid(
                         apps = results,
                         hiddenComponentKeys = hiddenComponentKeys,
+                        columns = drawerColumns,
+                        iconSizeDp = drawerIconSizeDp,
+                        iconShape = drawerIconShape,
+                        showLabels = drawerShowLabels,
+                        labelSizeSp = drawerLabelSizeSp,
+                        allowLabelWrap = drawerAllowLabelWrap,
+                        verticalSpacingDp = drawerVerticalSpacingDp,
                         onAppSelected = onAppSelected,
                         onShareApp = onShareApp,
                         onAppInfo = onAppInfo,
@@ -999,6 +1025,13 @@ private fun SectionLabel(text: String) {
 private fun AppGrid(
     apps: List<InstalledApp>,
     hiddenComponentKeys: Set<String>,
+    columns: Int,
+    iconSizeDp: Int,
+    iconShape: Shape,
+    showLabels: Boolean,
+    labelSizeSp: Int,
+    allowLabelWrap: Boolean,
+    verticalSpacingDp: Int,
     onAppSelected: (InstalledApp) -> Unit,
     onShareApp: (InstalledApp) -> Unit,
     onAppInfo: (InstalledApp) -> Unit,
@@ -1007,15 +1040,24 @@ private fun AppGrid(
     onOpenAppStore: (InstalledApp) -> Unit,
     onUninstallApp: (InstalledApp) -> Unit,
 ) {
-    val rows = ceil(apps.size / RESULT_COLUMNS.toFloat()).toInt().coerceAtLeast(1)
+    val safeColumns = columns.coerceAtLeast(1)
+    val rows = ceil(apps.size / safeColumns.toFloat()).toInt().coerceAtLeast(1)
+    val density = LocalDensity.current
+    val labelLineHeight = with(density) { (labelSizeSp * 1.4f).sp.toDp() }
+    val labelLines = if (allowLabelWrap) 2 else 1
+    val labelBlock = if (showLabels) 6.dp + labelLineHeight * labelLines else 0.dp
+    val cellHeight = iconSizeDp.dp + labelBlock
+    val gridHeight = cellHeight * rows +
+        verticalSpacingDp.dp * (rows - 1).coerceAtLeast(0) +
+        16.dp
     LazyVerticalGrid(
-        columns = GridCells.Fixed(RESULT_COLUMNS),
+        columns = GridCells.Fixed(safeColumns),
         modifier = Modifier
             .fillMaxWidth()
-            .height((rows * 94).dp),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+            .height(gridHeight),
+        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(verticalSpacingDp.dp),
         userScrollEnabled = false,
         overscrollEffect = null,
     ) {
@@ -1023,6 +1065,11 @@ private fun AppGrid(
             SearchResultTile(
                 app = app,
                 isHidden = app.componentKey in hiddenComponentKeys,
+                iconSizeDp = iconSizeDp,
+                iconShape = iconShape,
+                showLabels = showLabels,
+                labelSizeSp = labelSizeSp,
+                allowLabelWrap = allowLabelWrap,
                 onClick = { onAppSelected(app) },
                 onShare = { onShareApp(app) },
                 onInfo = { onAppInfo(app) },
@@ -1040,6 +1087,11 @@ private fun AppGrid(
 private fun SearchResultTile(
     app: InstalledApp,
     isHidden: Boolean,
+    iconSizeDp: Int,
+    iconShape: Shape,
+    showLabels: Boolean,
+    labelSizeSp: Int,
+    allowLabelWrap: Boolean,
     onClick: () -> Unit,
     onShare: () -> Unit,
     onInfo: () -> Unit,
@@ -1063,16 +1115,24 @@ private fun SearchResultTile(
                 ),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            IconOrFallback(app = app, size = 56.dp, fallbackFontSize = 20.sp)
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = app.label,
-                color = if (isHidden) OnHomeSecondary.copy(alpha = 0.55f) else OnHomeSecondary,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            IconOrFallback(
+                app = app,
+                size = iconSizeDp.dp,
+                fallbackFontSize = (labelSizeSp + 8).sp,
+                shape = iconShape,
+                fallbackBackground = Color(0x33FFFFFF),
             )
+            if (showLabels) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = app.label,
+                    color = if (isHidden) OnHomeSecondary.copy(alpha = 0.55f) else OnHomePrimary,
+                    fontSize = labelSizeSp.sp,
+                    textAlign = TextAlign.Center,
+                    maxLines = if (allowLabelWrap) 2 else 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
 
         DropdownMenu(
@@ -1234,5 +1294,3 @@ private fun AppMenuHeader(
         )
     }
 }
-
-private const val RESULT_COLUMNS = 4
